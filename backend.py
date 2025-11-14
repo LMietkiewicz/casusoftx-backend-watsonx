@@ -13,7 +13,7 @@ from typing import List, Tuple
 from sentence_transformers import SentenceTransformer
 from typing import List, Any, Dict
 from processing import processing_pipeline
-from utils import call_llm, search_vectors
+from utils import call_llm, search_vectors, convert_to_pdf
 
 import config
 
@@ -27,8 +27,19 @@ encoder = SentenceTransformer("sdadas/mmlw-retrieval-roberta-large-v2")
 
 #ollama.pull(model=MODEL)
 
-CONTENT_TYPES = ("application/pdf", "application/zip", "application/doc", "application/docx",  # potentional formats fo the future
-                 "application/txt", "application/xml", "application/x-zip-compressed")
+CONTENT_TYPES = (
+    "application/pdf", 
+    "application/zip", 
+    "application/x-zip-compressed",
+    "application/doc", 
+    "application/msword",
+    "application/docx", 
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/txt", 
+    "text/plain",
+    "application/xml", 
+    "text/xml"
+)
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor()
@@ -396,6 +407,33 @@ def create_task():
                         upload_to_milvus(processed_chunks)
 
                     with fitz.open(temp_file_path) as doc:    
+                        precomputed_summary = summary(doc)
+                    
+                    for task_dict in task_dicts:
+                        executor.submit(
+                            handle_task,
+                            document_id,
+                            task_dict["taskType"],
+                            task_dict["taskId"],
+                            params,
+                            success_cb,
+                            error_cb,
+                            precomputed_summary
+                        )
+
+                elif content_type in ("application/doc", "application/msword",
+                                    "application/docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    "application/txt", "text/plain", 
+                                    "application/xml", "text/xml"):
+                    # Convert to PDF first
+                    pdf_bytes = convert_to_pdf(temp_file_path, content_type)
+                    
+                    # Process as PDF
+                    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                        processed_chunks = processing_pipeline(doc, document_id, encoder)
+                        upload_to_milvus(processed_chunks)
+
+                    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:    
                         precomputed_summary = summary(doc)
                     
                     for task_dict in task_dicts:

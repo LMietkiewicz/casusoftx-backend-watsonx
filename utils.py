@@ -4,6 +4,9 @@ import config
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any
+from docx import Document
+import fitz
+import subprocess
 
 class ModelInferanceChat:
     def __init__(self):
@@ -211,3 +214,92 @@ def search_vectors(query_text: str, encoder: SentenceTransformer, document_id: s
         import traceback
         traceback.print_exc()
         return []
+    
+def convert_to_pdf(file_path: str, content_type: str) -> bytes:
+    """
+    Convert various file formats to PDF.
+    
+    Args:
+        file_path (str): Path to the input file
+        content_type (str): MIME type of the input file
+        
+    Returns:
+        bytes: PDF file as bytes
+        
+    Raises:
+        ValueError: If the content type is not supported
+        RuntimeError: If conversion fails
+    """
+    try:
+        # If already PDF, just return the bytes
+        if content_type == "application/pdf":
+            with open(file_path, 'rb') as f:
+                return f.read()
+        
+        # Handle text files (TXT, XML)
+        elif content_type in ("application/txt", "text/plain", "application/xml", "text/xml"):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text_content = f.read()
+            
+            # Create PDF from text
+            doc = fitz.open()
+            page = doc.new_page(width=595, height=842)  # A4 size
+            rect = fitz.Rect(50, 50, 545, 792)  # Margins
+            page.insert_textbox(rect, text_content, fontsize=10, fontname="helv")
+            
+            pdf_bytes = doc.tobytes()
+            doc.close()
+            return pdf_bytes
+        
+        # Handle DOCX files
+        elif content_type in ("application/docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+            doc_reader = Document(file_path)
+            
+            # Extract text from DOCX
+            full_text = []
+            for para in doc_reader.paragraphs:
+                full_text.append(para.text)
+            text_content = '\n'.join(full_text)
+            
+            # Create PDF
+            pdf_doc = fitz.open()
+            page = pdf_doc.new_page(width=595, height=842)
+            rect = fitz.Rect(50, 50, 545, 792)
+            page.insert_textbox(rect, text_content, fontsize=10, fontname="helv")
+            
+            pdf_bytes = pdf_doc.tobytes()
+            pdf_doc.close()
+            return pdf_bytes
+        
+        # Handle DOC files (requires antiword)
+        elif content_type in ("application/doc", "application/msword"):
+            try:
+                # Use antiword for conversion
+                result = subprocess.run(
+                    ['antiword', file_path],
+                    check=True,
+                    capture_output=True,
+                    timeout=30
+                )
+                text_content = result.stdout.decode('utf-8', errors='ignore')
+                
+                # Create PDF from extracted text
+                pdf_doc = fitz.open()
+                page = pdf_doc.new_page(width=595, height=842)
+                rect = fitz.Rect(50, 50, 545, 792)
+                page.insert_textbox(rect, text_content, fontsize=10, fontname="helv")
+                
+                pdf_bytes = pdf_doc.tobytes()
+                pdf_doc.close()
+                return pdf_bytes
+                
+            except FileNotFoundError:
+                raise RuntimeError("antiword not found. Install with: apt-get install antiword")
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"antiword conversion failed: {e.stderr.decode()}")
+        
+        else:
+            raise ValueError(f"Unsupported content type for conversion: {content_type}")
+            
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert file to PDF: {str(e)}")
