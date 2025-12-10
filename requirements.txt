@@ -1,0 +1,8 @@
+# Required libraries
+flask
+waitress
+PyMuPDF
+sentence-transformers
+pymilvus
+python-docx
+ibm-cloud-sdk-core
