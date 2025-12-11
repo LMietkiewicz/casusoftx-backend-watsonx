@@ -6,3 +6,4 @@ sentence-transformers
 pymilvus
 python-docx
 ibm-cloud-sdk-core
+python-dotenv

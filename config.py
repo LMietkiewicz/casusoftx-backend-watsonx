@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# --- Loading Dotenv ---
+load_dotenv()
 
 # --- Provider Configuration ---
 API_KEY = os.getenv("API_KEY", "")  
