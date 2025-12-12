@@ -60,7 +60,7 @@ def call_llm(
     """
     if options is None:
         options = {
-            "temperature": 0.2,
+            "temperature": 0.5,
             "top_k": 20,
             "top_p": 0.5,
             "num_predict": 1024,
@@ -102,10 +102,6 @@ def call_llm(
                 model_id=config.MODEL,
                 messages=messages,
                 temperature=options["temperature"],
-                top_k=options["top_k"],
-                top_p=options["top_p"],
-                max_tokens=options["num_predict"],
-                repetition_penalty=options["repeat_penalty"],
                 stream=False
             )
             
