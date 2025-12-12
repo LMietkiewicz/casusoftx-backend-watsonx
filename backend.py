@@ -12,7 +12,6 @@ import zipfile
 from typing import List, Tuple
 from sentence_transformers import SentenceTransformer
 from typing import List, Any, Dict
-from processing import processing_pipeline
 from utils import call_llm, search_vectors, convert_to_pdf
 
 import config
@@ -382,9 +381,7 @@ def create_task():
                             print(f"--- Page {page_num + 1} ---")
                             print(text)
                             print("\n" + "-" * 80 + "\n")"""
-                    
-                        processed_chunks = processing_pipeline(doc, document_id, encoder)
-                        upload_to_milvus(processed_chunks)
+                        upload_to_milvus(doc, document_id, encoder)
 
                     with fitz.open(stream=merged_pdf_bytes, filetype="pdf") as doc:
                         precomputed_summary = summary(doc)
@@ -403,8 +400,7 @@ def create_task():
 
                 elif content_type == "application/pdf":
                     with fitz.open(temp_file_path) as doc:
-                        processed_chunks = processing_pipeline(doc, document_id, encoder)
-                        upload_to_milvus(processed_chunks)
+                        upload_to_milvus(doc, document_id, encoder)
 
                     with fitz.open(temp_file_path) as doc:    
                         precomputed_summary = summary(doc)
@@ -430,8 +426,7 @@ def create_task():
                     
                     # Process as PDF
                     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-                        processed_chunks = processing_pipeline(doc, document_id, encoder)
-                        upload_to_milvus(processed_chunks)
+                        upload_to_milvus(doc, document_id, encoder)
 
                     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:    
                         precomputed_summary = summary(doc)
