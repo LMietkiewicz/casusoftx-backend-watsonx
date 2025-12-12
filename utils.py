@@ -105,7 +105,13 @@ def call_llm(
                 stream=False
             )
             
-            return response.get("generated_text", "").strip()
+            # Check if response is a dict (success) or string (error)
+            if isinstance(response, dict):
+                return response.get("generated_text", "").strip()
+            else:
+                # response is an error string
+                print(f"[ERROR] Watsonx API error: {response}")
+                raise Exception(f"Watsonx API failed: {response}")
             
     except requests.exceptions.RequestException as e:
         print(f"[ERROR] API request failed: {e}")
