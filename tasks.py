@@ -119,7 +119,7 @@ def summary(file):
                 """
 
                 options = {
-                    "temperature": 0.1,
+                    "temperature": 0.5,
                     "top_p": 0.5,
                     "num_predict": 1000,
                     "repeat_penalty": 1.1
@@ -164,7 +164,7 @@ def summary(file):
         """
         
         options = {
-            "temperature": 0.1,
+            "temperature": 0.5,
             "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
@@ -233,7 +233,7 @@ def summary_formatter(summary: str, max_retries: int = 5) -> str:
             """
 
             options = { 
-                "temperature": 0.1, 
+                "temperature": 0.5, 
                 "top_p": 0.5, 
                 "num_predict": 1000, 
                 "repeat_penalty": 1.1 
@@ -301,7 +301,7 @@ def category_subcategory(summary, categories_json):
         """
     
         options = {
-            "temperature": 0.1,
+            "temperature": 0.5,
             "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
@@ -356,7 +356,7 @@ def department_assignment(summary, departments_json):
         """
 
         options = {
-            "temperature": 0.1,
+            "temperature": 0.5,
             "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
@@ -421,7 +421,7 @@ def orlen_department_extraction(summary):
         """
 
         options = {
-            "temperature": 0.1,
+            "temperature": 0.5,
             "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
@@ -477,7 +477,7 @@ def base_extraction(summary):
         options = {
             "temperature": 0.2,
             "top_k": 10,
-            "top_p": 0.1,
+            "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
         }
@@ -607,7 +607,7 @@ def check_confidential(summary):
         options = {
             "temperature": 0.2,
             "top_k": 10,
-            "top_p": 0.1,
+            "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
         }
@@ -641,7 +641,7 @@ def other(prompt):
         options = {
             "temperature": 0.2,
             "top_k": 10,
-            "top_p": 0.1,
+            "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
         }
@@ -693,7 +693,7 @@ def suggested_action(summary):
         options = {
             "temperature": 0.2,
             "top_k": 10,
-            "top_p": 0.1,
+            "top_p": 0.5,
             "num_predict": 1000,
             "repeat_penalty": 1.1
         }
