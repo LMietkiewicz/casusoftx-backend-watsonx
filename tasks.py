@@ -126,7 +126,7 @@ def summary(file):
                 }
 
                 output = call_llm(
-                    endpoint="task",
+                    endpoint="generate",
                     input=text,
                     system_message=system,
                     options=options
@@ -171,7 +171,7 @@ def summary(file):
         }
 
         summary = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=text,
             system_message=system,
             options=options
@@ -240,7 +240,7 @@ def summary_formatter(summary: str, max_retries: int = 5) -> str:
             }
 
             output = call_llm(
-                endpoint="task",
+                endpoint="generate",
                 input=summary,
                 system_message=system,
                 options=options
@@ -308,7 +308,7 @@ def category_subcategory(summary, categories_json):
         }
 
         categories = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=summary,
             system_message=system,
             options=options
@@ -363,7 +363,7 @@ def department_assignment(summary, departments_json):
         }
 
         department = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=summary,
             system_message=system,
             options=options
@@ -428,7 +428,7 @@ def orlen_department_extraction(summary):
         }
 
         departament = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=summary,
             system_message=system,
             options=options
@@ -483,7 +483,7 @@ def base_extraction(summary):
         }
 
         extracted_info = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=summary,
             system_message=system,
             options=options
@@ -554,7 +554,7 @@ def base_extraction_formatter(raw_extraction_text):
         }
 
         formatted_output = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=raw_extraction_text,
             system_message=system,
             options=options
@@ -613,7 +613,7 @@ def check_confidential(summary):
         }
 
         contains_confidential = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=summary,
             system_message=system,
             options=options
@@ -647,7 +647,7 @@ def other(prompt):
         }
 
         response = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=prompt,
             options=options
         )
@@ -699,7 +699,7 @@ def suggested_action(summary):
         }
 
         suggested_action = call_llm(
-            endpoint="task",
+            endpoint="generate",
             input=summary,
             system_message=system,
             options=options

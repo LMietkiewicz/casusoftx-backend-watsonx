@@ -5,5 +5,5 @@ PyMuPDF
 sentence-transformers
 pymilvus
 python-docx
-ibm-cloud-sdk-core
+ibm-watsonx-ai
 python-dotenv

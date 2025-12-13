@@ -1,5 +1,7 @@
+from ibm_watsonx_ai.foundation_models import ModelInference
+from ibm_watsonx_ai.foundation_models.schema import TextChatParameters
+from ibm_watsonx_ai import Credentials
 import requests
-from ibm_cloud_sdk_core import IAMTokenManager
 import config
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
 from sentence_transformers import SentenceTransformer
@@ -7,39 +9,10 @@ from typing import List, Dict, Any
 from docx import Document
 import fitz
 import subprocess
-
-class ModelInferanceChat:
-    def __init__(self):
-        self.access_token = IAMTokenManager(apikey=config.API_KEY).get_token()
-        self.project_id = config.PROJECT_ID
-
-    def chat(
-        self, 
-        model_id, 
-        messages, 
-        **kwargs
-    ):
-        wml_url = f"{config.INFERENCE_PROVIDER_BASE_URL}/ml/v1/text/chat?version=2024-10-07"
-        Headers = {
-            "Authorization": "Bearer " + self.access_token,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        data = {
-            "model_id": model_id,
-            "messages": messages,
-            "project_id": self.project_id,
-        }
-        data = data | kwargs
-        response = requests.post(wml_url, json=data, headers=Headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return response.text
         
 def call_llm(
-    endpoint: str,
     input: str,
+    endpoint: str = "generate",
     system_message: str = "",
     options: Dict[str, Any] = None
 ) -> str:
@@ -61,7 +34,6 @@ def call_llm(
     if options is None:
         options = {
             "temperature": 0.5,
-            "top_k": 20,
             "top_p": 0.5,
             "num_predict": 1024,
             "repeat_penalty": 1.1
@@ -88,30 +60,37 @@ def call_llm(
             
             response.raise_for_status()
             json_response = response.json()
+
             return json_response.get("response", "").strip()
             
         else:
             # Using IBM Watsonx
-            chat_client = ModelInferanceChat()
+            deployment_inference = ModelInference(
+                model_id=config.MODEL,
+                credentials=Credentials(
+                    api_key=config.API_KEY, url=config.INFERENCE_PROVIDER_BASE_URL
+                ),
+                project_id=config.PROJECT_ID,
+            )
+
             messages = [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": input}
             ]
-            
-            response = chat_client.chat(
-                model_id=config.MODEL,
-                messages=messages,
+
+            params = TextChatParameters(
                 temperature=options["temperature"],
-                stream=False
+                max_new_tokens=options["num_predict"],
+                top_p=options["top_p"],
+                repetition_penalty=options["repeat_penalty"]
             )
             
-            # Check if response is a dict (success) or string (error)
-            if isinstance(response, dict):
-                return response.get("generated_text", "").strip()
-            else:
-                # response is an error string
-                print(f"[ERROR] Watsonx API error: {response}")
-                raise Exception(f"Watsonx API failed: {response}")
+            response = deployment_inference.chat(
+                messages=messages,
+                params=params
+            )
+            
+            return response["choices"][0]["message"]["content"].strip()
             
     except requests.exceptions.RequestException as e:
         print(f"[ERROR] API request failed: {e}")
