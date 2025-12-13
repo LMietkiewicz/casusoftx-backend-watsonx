@@ -80,7 +80,7 @@ def call_llm(
 
             params = TextChatParameters(
                 temperature=options["temperature"],
-                max_new_tokens=options["num_predict"],
+                max_tokens=options["num_predict"],
                 top_p=options["top_p"],
                 repetition_penalty=options["repeat_penalty"]
             )

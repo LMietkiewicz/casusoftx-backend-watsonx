@@ -18,6 +18,7 @@ def upload_to_milvus(doc: object, file_id: str, model: SentenceTransformer):
     Skips upload if file_id already exists in the collection.
     """
     collection_name = "file_embeddings"
+    file_id = int(file_id)
 
     try:
         print("Connecting to Milvus...")
