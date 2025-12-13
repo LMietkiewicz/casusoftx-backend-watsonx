@@ -234,7 +234,6 @@ def run_rag_with_context(query: str, context_fragments: List[Dict[str, Any]], is
          # 3. Set model options
         options = {
             "temperature": 0.2,
-            "top_k": 20,
             "top_p": 0.5,
             "num_predict": 1024,
             "repeat_penalty": 1.1
