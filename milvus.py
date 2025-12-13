@@ -54,6 +54,7 @@ schema.add_field(
 schema.add_field(
   field_name="contents",
   datatype=DataType.VARCHAR,
+  enable_analyzer=True,
   analyzer_params=analyzer_params,
   max_length=30000
 )
