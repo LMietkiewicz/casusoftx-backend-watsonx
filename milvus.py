@@ -83,15 +83,20 @@ schema.add_function(bm25)
 index_params = MilvusClient.prepare_index_params()
 
 index_params.add_index(
-  field_name="dense_vector", 
+  field_name="dense_embedding", 
   index_type="FLAT", 
   metric_type="IP"
 )
 
 index_params.add_index(
-  field_name="sparse_embedding",
-  index_type="SPARSE_INVERTED_INDEX",
-  metric_type="BM25",
+    field_name="sparse_embedding",
+    index_type="SPARSE_INVERTED_INDEX",
+    metric_type="BM25", 
+    params={
+        "inverted_index_algo": "DAAT_MAXSCORE",
+        "bm25_k1": 1.2,
+        "bm25_b": 0.75
+    }
 )
 
 # Create collection
@@ -99,5 +104,6 @@ client.create_collection(
   collection_name="file_embeddings",
   schema=schema,
   index_params=index_params,
+  consistency_level="Strong"
 )
 print(f"Collection 'file_embeddings' created successfully")
