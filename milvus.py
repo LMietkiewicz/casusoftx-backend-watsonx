@@ -13,7 +13,7 @@ if client.has_collection("file_embeddings"):
 # Define analyzer parameters
 analyzer_params = {
   "tokenizer": "standard",
-  "filter": ["lowercase", "removepunct"]
+  "filter": ["lowercase"]
 }
 
 # Create collection schema
