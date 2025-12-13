@@ -34,7 +34,7 @@ def upload_to_milvus(doc: object, file_id: str, model: SentenceTransformer):
 
         # 2. Query Milvus to see if any records with this file_id already exist
         # Important: String fields need quotes in the filter expression
-        filter_expr = f"file_id == '{file_id}'"
+        filter_expr = f"file_id == {file_id}"
         
         print(f"Checking for existing records with file_id: '{file_id}'...")
         existing_records = client.query(
