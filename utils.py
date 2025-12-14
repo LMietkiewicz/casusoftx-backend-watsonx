@@ -102,6 +102,7 @@ def call_llm(
 def search_vectors(query_text: str, encoder: SentenceTransformer, document_id: str = None, top_k: int = 10) -> List[Dict[str, Any]]:
     
     collection_name = "file_embeddings"
+    document_id = int(document_id) if document_id is not None else None
     
     try:
         print("Connecting to Milvus...")
@@ -121,7 +122,7 @@ def search_vectors(query_text: str, encoder: SentenceTransformer, document_id: s
         # Construct the filter expression for child chunks only
         filter_expr = "hierarchy == 'child'"
         if document_id:
-            filter_expr += f" and file_id == '{document_id}'"  # String fields need quotes
+            filter_expr += f" and file_id == {document_id}"  # String fields need quotes
 
         # Create Dense Search Request (Semantic Search)
         dense_search_params = {
