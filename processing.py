@@ -1,3 +1,4 @@
+"""processing.py - core processing logic for PDF text and table extraction, chunking, and embedding preparation"""
 import re
 from typing import List, Dict, Any, Tuple
 import json

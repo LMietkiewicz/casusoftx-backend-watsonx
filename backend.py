@@ -1,3 +1,4 @@
+"""backend.py - main Flask application for handling document processing tasks, RAG queries, and integration with Milvus and LLMs"""
 from flask import Flask, request, jsonify
 from waitress import serve
 from concurrent.futures import ThreadPoolExecutor

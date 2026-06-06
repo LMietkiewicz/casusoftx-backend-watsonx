@@ -1,3 +1,4 @@
+"""milvus.py - setup and configuration for Milvus vector database"""
 from pymilvus import MilvusClient, DataType, Function, FunctionType
 import config
 

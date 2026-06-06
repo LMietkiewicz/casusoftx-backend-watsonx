@@ -1,3 +1,4 @@
+"""config.py - central configuration management for environment variables, API keys, and application settings"""
 import os
 from dotenv import load_dotenv
 
