@@ -1,9 +1,30 @@
-# Required libraries
-flask
-waitress
-PyMuPDF
-sentence-transformers
-pymilvus
-python-docx
-ibm-watsonx-ai
-python-dotenv
+# Pinned direct dependencies. Versions current as of 2026-06-13.
+# These pin only DIRECT deps — see the note at the bottom about locking the full
+# transitive tree (torch in particular) for true reproducibility.
+
+# --- Web layer ---
+flask==3.1.3
+waitress==3.0.2
+
+# --- HTTP client (used directly in utils.py + backend.py) ---
+requests==2.34.2
+
+# --- Documents ---
+PyMuPDF==1.27.2.3              # provides the `fitz` module
+
+# --- Embeddings / vector database ---
+sentence-transformers==5.5.1
+pymilvus==2.6.15              # MUST match your Milvus SERVER major version.
+                              # Code targets the 2.x API; do NOT use 3.0.0
+                              # unless you have moved to a Milvus 3.x server.
+
+# --- watsonx provider (pin matters: the structured-output / response_format API) ---
+ibm-watsonx-ai==1.5.13
+
+# --- Structured output (Pydantic v2 API; must not float to v3) ---
+pydantic==2.13.4
+
+# --- Configuration ---
+python-dotenv==1.2.2
+
+# Removed: python-docx — not imported anywhere (Gotenberg handles conversion).

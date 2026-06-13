@@ -1,760 +1,468 @@
-"""tasks.py - core, LLM-based or LLM-adjacent, processing tasks for document handling, summarization, categorization, and Milvus integration"""
-#from pymilvus import Collection, utility, Connections
-import json
-import re
-from processing import processing_pipeline
-import random
-from sentence_transformers import SentenceTransformer
-from pymilvus import MilvusClient
+"""tasks.py - the LLM-driven document tasks: summarization, classification,
+extraction, confidentiality, and recommendations.
+
+Design after the structured-output rework:
+
+* Classification/extraction/confidentiality use **structured output** — a JSON
+  schema is passed to ``call_llm`` (enforced on Ollama, prompt-directed on
+  watsonx), then validated and rendered via ``structured_output``. This removes
+  the old JSON-parsing fragility and the separate "formatter" LLM passes.
+* Prose tasks (summary, suggested actions) return a single paragraph cleaned by
+  the deterministic ``strip_markdown`` instead of an LLM formatting loop.
+* Prompts are slim — they target a capable model (Llama). The Qwen preamble is
+  the one model-specific workaround kept, since Qwen is overfit to it.
+
+Tasks do not swallow errors; failures propagate to ``handle_task`` in backend.py.
+``upload_to_milvus`` now lives in utils.py (it is Milvus infrastructure).
+"""
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import config
-from utils import call_llm
+from structured_output import (
+    ExtractionResult,
+    MANUAL_REVIEW,
+    build_category_schema,
+    build_department_schema,
+    confidential_schema,
+    extraction_schema,
+    render_confidential,
+    render_extraction,
+    resolve_category,
+    resolve_confidential,
+    resolve_department,
+    validate_model,
+)
+from processing import TEXT_SEPARATORS, create_text_parent_chunks
+from utils import call_llm, strip_markdown
 
-# ------------------------------- Tasks should be updated in the future -------------------------------
+if TYPE_CHECKING:  # type-only; the doc is passed in, never imported at runtime
+    import fitz
+
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Shared prompt scaffolding
+# --------------------------------------------------------------------------- #
+# Qwen is overfit to an English priming preamble before switching to Polish;
+# every other model (Llama primary) gets a concise Polish role sentence.
+_QWEN_INTRO = (
+    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. "
+    "From now on, you will receive instructions in Polish only. "
+    "Your answers HAVE TO be in Polish only as well."
+)
+
+_ROLE_SUMMARY = "Jesteś asystentem AI streszczającym dokumenty."
+_ROLE_CATEGORY = "Jesteś asystentem AI kategoryzującym dokumenty."
+_ROLE_DEPARTMENT = "Jesteś asystentem AI przypisującym dokumenty do departamentów."
+_ROLE_EXTRACTION = "Jesteś asystentem AI wyodrębniającym dane z dokumentów."
+_ROLE_CONFIDENTIAL = "Jesteś asystentem AI wykrywającym dane wrażliwe w dokumentach."
+_ROLE_SUGGESTED = "Jesteś asystentem AI proponującym działania na podstawie dokumentów."
+
+# Sampling profiles. Structured tasks use temperature 0 for determinism.
+_BALANCED_OPTIONS: Dict[str, Any] = {"temperature": 0.5, "top_p": 0.5, "num_predict": 1000, "repeat_penalty": 1.1}
+_PRECISE_OPTIONS: Dict[str, Any] = {"temperature": 0.2, "top_p": 0.5, "num_predict": 1000, "repeat_penalty": 1.1}
+_STRUCTURED_OPTIONS: Dict[str, Any] = {"temperature": 0.0, "top_p": 1.0, "num_predict": 1024, "repeat_penalty": 1.0}
+
+_MAX_REDUCE_PASSES = 5  # safety bound on hierarchical summary reduction
 
 
-def upload_to_milvus(doc: object, file_id: str, model: SentenceTransformer):
-    """
-    Uploads document chunks to Milvus after processing.
-    Skips upload if file_id already exists in the collection.
-    """
-    collection_name = "file_embeddings"
-    file_id = int(file_id)
+def _build_system(role: str, body: str) -> str:
+    """Assemble a system prompt: model-appropriate intro + task body."""
+    intro = _QWEN_INTRO if "qwen" in config.MODEL.lower() else role
+    return f"{intro}\n\n{body}"
 
-    try:
-        print("Connecting to Milvus...")
-        client = MilvusClient(
-            uri=f"http://{config.MILVUS_HOST}:{config.MILVUS_PORT}"
-        )
-        print("Successfully connected to Milvus.")
-        
-        # 1. Check if the collection exists
-        if not client.has_collection(collection_name):
-            print(f"Error: Collection '{collection_name}' does not exist.")
-            return
 
-        # 2. Query Milvus to see if any records with this file_id already exist
-        # Important: String fields need quotes in the filter expression
-        filter_expr = f"file_id == {file_id}"
-        
-        print(f"Checking for existing records with file_id: '{file_id}'...")
-        existing_records = client.query(
-            collection_name=collection_name,
-            filter=filter_expr,
-            output_fields=["file_id"],
-            limit=1
-        )
+def _run_llm_task(
+    role: str,
+    body: str,
+    user_input: str,
+    options: Optional[Dict[str, Any]] = None,
+    *,
+    schema: Optional[Dict[str, Any]] = None,
+    task_name: str,
+) -> str:
+    """Build the system prompt and run one LLM call (optionally structured)."""
+    logger.debug("Running task %s (structured=%s)", task_name, schema is not None)
+    return call_llm(
+        prompt=user_input,
+        system_message=_build_system(role, body),
+        options=options,
+        schema=schema,
+    )
 
-        # 3. Check the result. If the list is not empty, the file exists
-        if existing_records:
-            print(f"File '{file_id}' already exists in the Milvus collection. Skipping upload.")
-            return
-        
-        print(f"File '{file_id}' not found. Starting processing pipeline...")
-        
-        # 4. If the file doesn't exist, run the full processing pipeline
-        processed_data = processing_pipeline(doc, file_id, model)
 
-        # 5. Insert the newly processed data
-        if processed_data:
-            print(f"Uploading {len(processed_data)} chunks to Milvus...")
-            
-            # Insert data (MilvusClient handles flushing automatically)
-            insert_result = client.insert(
-                collection_name=collection_name,
-                data=processed_data
-            )
-            
-            print(f"Upload complete. Inserted {insert_result['insert_count']} records.")
-        else:
-            print("Processing pipeline returned no data to upload.")
+# --------------------------------------------------------------------------- #
+# Structured-output resolution cascade
+# --------------------------------------------------------------------------- #
+# schema check -> coercion (inside the resolver) -> LLM repair (capped) -> manual.
+# The repair re-asks with the rejected answer and an instruction to pick only
+# from the allowed options the system prompt already lists.
+_REPAIR_DIRECTIVE = (
+    "Twoja poprzednia odpowiedź była niepoprawna: nie pasowała do wymaganego "
+    "formatu lub zawierała wartość spoza dozwolonej listy. Wybierz wartości "
+    "WYŁĄCZNIE z dozwolonych opcji podanych powyżej i zwróć poprawny obiekt."
+)
 
-    except Exception as e:
-        print(f"An error occurred during the Milvus operation: {e}")
-        import traceback
-        traceback.print_exc()
-  
 
-def summary(file):
-    """
-    Summarizes a legal PDF document using a local Ollama model.
-    
-    Args:
-        pdf_path (str): Path to the PDF file.
-        model (str): Ollama model name (e.g. "llama3", "OLLAMA_MODEL").
-    
-    Returns:
-        str
-    """
+def _repair_call(
+    role: str,
+    body: str,
+    original_input: str,
+    bad_raw: str,
+    schema: Dict[str, Any],
+    task_name: str,
+) -> str:
+    """Re-request a structured answer, showing the model its rejected output."""
+    logger.debug("Repair call for %s", task_name)
+    system_message = _build_system(role, body) + "\n\n" + _REPAIR_DIRECTIVE
+    prompt = f"{original_input}\n\n[Niepoprawna odpowiedź do poprawienia]:\n{bad_raw}"
+    return call_llm(prompt=prompt, system_message=system_message, options=_STRUCTURED_OPTIONS, schema=schema)
 
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w streszczaniu dokumentów." 
-    
-    try:
-        page_summaries = []
-        
-        if len(file) > 15:
 
-            for i, page in enumerate(file):
-                text = page.get_text().strip()
+def _resolve_with_repair(
+    initial_raw: str,
+    resolve_once: "Callable[[str], Any]",
+    repair: "Callable[[str], str]",
+    *,
+    max_attempts: int,
+    sentinel: Any,
+    task_name: str,
+) -> Any:
+    """Run the resolve -> repair -> manual cascade.
 
-                if not text:
-                    print(f"Skipping empty page {i+1}")
-                    continue
-
-                print(f"Sumarizing page {i+1}/{len(file)}...")
-
-                system = f"""
-                {introduction}
-
-                **ZADANIE:**
-                Twoim zadaniem jest wygenerowanie **zwięzłego i formalnego streszczenia** pojedynczej strony dokumentu.
-
-                **WYMAGANIA:**
-                - **Język:** wyłącznie polski, formalny, rzeczowy.
-                - **Treść:** Zachowaj wszystkie kluczowe informacje prawne, daty, nazwy stron i istotne postanowienia.
-                - **Styl:** Streszczenie musi być obiektywne, bez żadnych komentarzy, interpretacji, opinii, wstępów ani zakończeń.
-                - **Format:** Zwróć tylko czysty tekst streszczenia.
-                - **Długość:** Streszczenie powinno być jak najkrótsze, ale zawierać wszystkie niezbędne detale. Staraj się zmieścić w około 50-70 słowach.
-                """
-
-                options = {
-                    "temperature": 0.5,
-                    "top_p": 0.5,
-                    "num_predict": 1000,
-                    "repeat_penalty": 1.1
-                }
-
-                output = call_llm(
-                    endpoint="generate",
-                    input=text,
-                    system_message=system,
-                    options=options
-                )
-
-                output.raise_for_status()
-                json_output = output.json()        
-                
-                summary = json_output.get("response", "")
-
-                page_summaries.append(summary)
-
-        print("Generowanie końcowego streszczenia...")
-
-        if len(page_summaries) > 0:
-            text = "\n\n".join(summary for summary in page_summaries)
-        else:
-            text = "\n\n".join(page.get_text().strip() for page in file)
-
-        system = f"""
-        {introduction}
-
-        **ZADANIE:** 
-        Twoim zadaniem jest wygenerowanie **jednego, zwięzłego i formalnego streszczenia całego dokumentu**, bazując na dostarczonych fragmentach lub całym tekście.
-
-        **WYMAGANIA:**
-        - **Język:** wyłącznie polski, formalny, rzeczowy.
-        - **Treść:** Ujmij wszystkie najważniejsze punkty, ustalenia, daty i strony z całego dokumentu.
-        - **Styl:** Streszczenie musi być obiektywne, bez żadnych komentarzy, interpretacji, opinii, wstępów ani zakończeń.
-        - **Format:** Zwróć tylko jeden, spójny akapit. 
-        - **Długość:** Całe streszczenie powinno być zwięzłe.
-
-        **PRZYKŁAD FORMATU ODPOWIEDZI:**
-        Dokument dotyczy umowy z dnia XX.YY.ZZZZ pomiędzy Firmą A a Firmą B, obejmującej zakres prac P i Q. Ustalono termin realizacji do DD.MM.RRRR oraz warunki płatności określone w paragrafie X.
-        """
-        
-        options = {
-            "temperature": 0.5,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
-
-        summary = call_llm(
-            endpoint="generate",
-            input=text,
-            system_message=system,
-            options=options
-        )
-
-    except Exception as e:
-        print(f"Error generating summary: {e}")
-
-    return summary
-
-def summary_formatter(summary: str, max_retries: int = 5) -> str:
-    """
-    Converts a given text into a single, cohesive paragraph using a self-correction loop.
-    It will retry up to 'max_retries' times if the output contains markdown.
+    ``resolve_once`` returns the resolved value (parse + coerce/validate) or
+    ``None``. On ``None`` and while attempts remain, ``repair`` produces a fresh
+    raw answer and we retry. After ``max_attempts`` repairs the document is
+    routed to manual review via ``sentinel``.
 
     Args:
-        summary (str): The text to be reformatted.
-        max_retries (int): The maximum number of times to loop the formatting process.
+        initial_raw: The first model output.
+        resolve_once: Pure resolver; value or ``None``.
+        repair: Re-request callable; takes the bad raw, returns new raw.
+        max_attempts: Maximum repair attempts (0 disables repair).
+        sentinel: Returned when everything fails (the manual-review value).
+        task_name: For logging.
 
     Returns:
-        str: The reformatted text in paragraph form.
+        The resolved value, or ``sentinel``.
     """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w weryfikowaniu i poprawianiu formatowania tekstu."
-
-    if not summary or not summary.strip():
-        return "" 
-
-    current_text = summary
-    
-    for i in range(max_retries):
-        print(f"Formatting attempt {i + 1}/{max_retries}...")
-        try:
-            system = f"""
-            {introduction}
-            
-            **ZADANIE:** 
-            Twoim **JEDYNYM ZADANIEM** jest przekształcenie dostarczonego tekstu w **jeden, spójny akapit**, bez żadnych dodatków.
-
-            **WYMAGANIA KRYTYCZNE (BEZWZGLĘDNIE OBOWIĄZUJĄCE):**
-            1.  **Odpowiedź musi być WYŁĄCZNIE CZYSTYM TEKSTEM JEDNEGO AKAPITU.**
-            2.  **NIE DODAJ ABSOLUTNIE NICZEGO INNEGO:**
-                * **Żadnych wstępów** (np. "Oto tekst w formie akapitu:", "Twoja prośba została zrealizowana:").
-                * **Żadnych powitań, zakończeń, pytań, komentarzy, wyjaśnień, ani zdań wprowadzających.**
-                * **Żadnych znaków formatowania Markdown jak `**` lub `*`**.
-                * **Żadnych podziałów linii**, ani nagłówków.
-            3.  Zachowaj **całą istotną treść** z oryginalnego tekstu.
-            4.  Połącz wszystkie zdania w jedną, płynną całość.
-            5.  Odpowiedź musi być **wyłącznie w języku polskim**.
-
-            **!!!WAŻNE!!!**
-            Jeżeli otrzymany tekst już jest w formie jednego akapitu i **NIE ZAWIERA ŻADNEGO FORMATOWANIA MARKDOWN**, zwróć go **BEZ ŻADNYCH ZMIAN**.
-
-            **PRZYKŁAD ODPOWIEDZI, KTÓRA JEST POPRAWNA (dokładnie taki format, bez dodatków):**
-            Powyższy protokół dotyczy przeglądu technicznego wózka jezdniowego. Wykonano go 29 kwietnia 2025. Eksploatującym jest ORLEN S.A. Oddział PGNIG w Sanoku. Urządzenie to wózek typu EV-717. Wynik badania był pozytywny, a następny termin to kwiecień 2026.
-            """
-
-            options = { 
-                "temperature": 0.5, 
-                "top_p": 0.5, 
-                "num_predict": 1000, 
-                "repeat_penalty": 1.1 
-            }
-
-            output = call_llm(
-                endpoint="generate",
-                input=summary,
-                system_message=system,
-                options=options
-            )
-
-            # --- The Correction Check ---
-            if "**" not in output:
-                print("Formatting successful.")
-                return output # Return the clean text
-            else:
-                print("Formatting failed, markdown detected. Retrying...")
-                current_text = output # The failed output becomes the new input
-
-        except Exception as e:
-            print(f"Error during formatting attempt {i + 1}: {e}")
-            return current_text # Return the last known text on error
-
-    # If the loop finishes without a clean result, return the last attempt
-    print(f"Could not format text cleanly after {max_retries} attempts.")
-    return current_text
+    raw = initial_raw
+    for attempt in range(max_attempts + 1):
+        result = resolve_once(raw)
+        if result is not None:
+            if attempt:
+                logger.info("%s: resolved after %d repair attempt(s)", task_name, attempt)
+            return result
+        if attempt < max_attempts:
+            logger.info("%s: unresolved, repair attempt %d/%d", task_name, attempt + 1, max_attempts)
+            raw = repair(raw)
+    logger.warning("%s: unresolved after %d attempt(s); routing to manual review", task_name, max_attempts + 1)
+    return sentinel
 
 
-def category_subcategory(summary, categories_json):
-    """
-    Assigns a legal document to one category and one of its subcategories using Ollama.
+# --------------------------------------------------------------------------- #
+# Summarization (token-budget map-reduce; prose output, markdown-stripped)
+# --------------------------------------------------------------------------- #
+_SUMMARY_MAP_BODY = (
+    "Streść poniższy fragment dokumentu zwięźle i formalnie, po polsku. "
+    "Zachowaj kluczowe fakty, daty, nazwy stron i istotne postanowienia. "
+    "Zwróć wyłącznie samo streszczenie, bez komentarzy."
+)
+_SUMMARY_FINAL_BODY = (
+    "Na podstawie poniższego tekstu napisz jedno zwięzłe, formalne streszczenie "
+    "całego dokumentu w jednym akapicie, po polsku. Ujmij najważniejsze punkty, "
+    "daty i strony. Zwróć wyłącznie samo streszczenie, bez komentarzy."
+)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Approximate token count from character length (config.CHARS_PER_TOKEN)."""
+    return int(len(text) / config.CHARS_PER_TOKEN)
+
+
+def _summarize_text(text: str, *, final: bool) -> str:
+    """Summarize one block of text (a map chunk, or the final reduction)."""
+    body = _SUMMARY_FINAL_BODY if final else _SUMMARY_MAP_BODY
+    return _run_llm_task(
+        _ROLE_SUMMARY, body, text, _BALANCED_OPTIONS,
+        task_name="SUMMARY_FINAL" if final else "SUMMARY_MAP",
+    )
+
+
+def summary(doc: "fitz.Document") -> str:
+    """Summarize a document (single-pass or map-reduce by token budget).
 
     Args:
-        summary (str): Summaries of each page of the document.
-        categories_json (dict): JSON of categories
-        model (str): Name of the Ollama model to use.
+        doc: An open PyMuPDF document.
 
     Returns:
-        str
+        A single-paragraph Polish summary with Markdown stripped, or "" if the
+        document has no extractable text.
     """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w kategoryzowaniu dokumentów."
-
-    try:
-        system = f"""
-        {introduction}
-
-        **ZADANIE**
-        Twoim zadaniem jest przypisanie dostarczonego podsumowania dokumentu do **najlepiej pasującej kategorii głównej** z listy. 
-        Następnie, **jeśli wybrana kategoria posiada podkategorie**, przypisz dokument również do jednej z jej podkategorii.
-
-        **DOSTĘPNE KATEGORIE I PODKATEGORIE:**
-        {json.dumps(categories_json, ensure_ascii=False, indent=2)}
-
-        **WYMAGANIA ODPOWIEDZI:**
-        - Odpowiedź musi być **wyłącznie w formacie JSON**.
-        - JSON musi zawierać **dokładnie** dwa klucze: `"category"` i `"subcategory"`.
-        - **Jeśli wybrana kategoria główna nie ma zdefiniowanych podkategorii, wartość dla klucza `"subcategory"` musi wynosić `null`.**
-        - Wartości kluczy muszą być **dokładnymi nazwami** kategorii i podkategorii z listy DOSTĘPNYCH OPCJI.
-        - **NIE WOLNO** dodawać żadnego tekstu przed, po, ani poza formatem JSON (bez wstępów, wyjaśnień, ani innych słów).
-        """
-    
-        options = {
-            "temperature": 0.5,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
-
-        categories = call_llm(
-            endpoint="generate",
-            input=summary,
-            system_message=system,
-            options=options
-        )
-
-        print("Ukończono przydzielanie kategorii/podkategorii.")
-
-    except Exception as e:
-        print(f"Error assigning category/subcategory: {e}")
-
-    return categories
-
-def department_assignment(summary, departments_json): 
-    """
-    Assigns a document to the most appropriate department based on content.
-
-    Args:
-        pages_summaries (list): List of strings, each representing a page summary.
-        departments_json (dict): Dictionary with departaments names and descriptions:
-        model (str): Name of the Ollama model to use.
-
-    Returns:
-        str
-    """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w przypisaniu dokumentów do departamentów."
-
-    try:
-        system = f"""
-        {introduction}
-        
-        **ZADANIE**
-        Twoim zadaniem jest przypisanie podsumowania dokumentu do **najbardziej odpowiedniego departamentu** z poniższej listy.
-
-        **DOSTĘPNE DEPARTAMENTY:**
-        {json.dumps(departments_json, ensure_ascii=False, indent=2)}
-
-        **WYMAGANIA ODPOWIEDZI:**
-        - Odpowiedź musi być **wyłącznie nazwą jednego departamentu** z listy `DOSTĘPNE DEPARTAMENTY`.
-        - **Nie wolno** dodawać żadnego tekstu przed, po, ani poza nazwą departamentu (bez wstępów, wyjaśnień, znaków interpunkcyjnych, cudzysłowów, ani innych słów).
-        - **Zawsze** musisz wybrać jedną z podanych nazw, nawet jeśli dopasowanie nie jest idealne. W takim przypadku wybierz najbardziej prawdopodobny departament.
-        """
-
-        options = {
-            "temperature": 0.5,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
-
-        department = call_llm(
-            endpoint="generate",
-            input=summary,
-            system_message=system,
-            options=options
-        )
-
-        print("Ukończono przydzielanie departamentu.")
-
-    except Exception as e:
-        print(f"Error assigning department: {e}")
-
-    return department
-
-def orlen_department_extraction(summary): 
-    """
-    Assigns a document to the most appropriate department based on content.
-
-    Args:
-        pages_summaries (list): List of strings, each representing a page summary.
-        departments_json (dict): Dictionary with departaments names and descriptions:
-        model (str): Name of the Ollama model to use.
-
-    Returns:
-        str
-    """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w przypisaniu dokumentów do departamentów."
-
-    try:
-        DEPARTMENT_NAMES_CANONICAL = [
-            "ODDZIAŁ W SANOKU",
-            "ODDZIAŁ W ZIELONEJ GÓRZE",
-            "ODDZIAŁ W ODOLANOWIE",
-            "ODDZIAŁ GEOLOGII I EKSPLOATACJI",
-            "LABORATORIUM POMIAROWO-BADAWCZE",
-            "RATOWNICZA STACJA GÓRNICTWA OTWOROWE"
-        ]
-
-        system = f"""
-        {introduction}
-        
-        **ZADANIE**
-        Twoim jedynym zadaniem jest analiza dostarczonego tekstu wiadomości i wskazanie nazwy departamentu nadawcy z poniższej listy.
-
-        **DOSTĘPNE DEPARTAMENTY (Wybierz TYLKO JEDNĄ nazwę):**
-        [{" , ".join(DEPARTMENT_NAMES_CANONICAL)}]
-
-        **WYMAGANIA ODPOWIEDZI:**
-        - MUSISZ ZWRÓCIĆ TYLKO NAZWĘ JEDNEGO Z DEPARTAMENTÓW WSKAZANYCH POWYŻEJ. Nic więcej.
-        - Nie dodawaj żadnych wstępów, wyjaśnień, znaków interpunkcyjnych, cudzysłowów, ani innych słów.
-        - Zawsze musisz wybrać jedną z podanych nazw, nawet jeśli nie jesteś pewien – wybierz wtedy najbardziej prawdopodobną.
-        - Odpowiedź musi być w dokładnej oryginalnej formie jak na liście (z zachowaniem spacji i wielkich liter).
-        """
-
-        options = {
-            "temperature": 0.5,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
-
-        departament = call_llm(
-            endpoint="generate",
-            input=summary,
-            system_message=system,
-            options=options
-        )
-
-        print("Ukończono ustalanie nadawcy wiadomości.")
-
-    except Exception as e:
-        print(f"Error assigning Orlen department: {e}")
-
-    return departament
-
-def base_extraction(summary):
-    """
-    Extracts a specific piece of legal information from the full document text using Ollama.
-    
-    Args:
-        text (str): Full text of the document (not summary).
-        info_request (str): What to extract (e.g. "Data podpisania umowy").
-        model (str): Ollama model name.
-        ollama_host (str): Remote/local Ollama server URL.
-    
-    Returns:
-        str
-    """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w ekstrakcji informacji z dokumentów."
-
-    try:
-        system = f"""
-        {introduction}
-        
-        **ZADANIE** 
-        Twoim zadaniem jest zidentyfikowanie i wyodrębnienie najważniejszych danych, faktów i postanowień z tekstu.
-
-        **WYMAGANIA ODPOWIEDZI:**
-        - Odpowiedź musi być **po polsku**, w formie **zwięzłego, czytelnego akapitu**.
-        - **Nie wolno** dodawać żadnych wstępów, zakończeń, komentarzy ani zbędnych słów. Zwróć **tylko** wyodrębnione informacje.
-        - Wyodrębnij daty, nazwy stron, kwoty, terminy, numery referencyjne, kluczowe zobowiązania oraz inne istotne detale, które charakteryzują dokument.
-        - Zachowaj formatowanie i interpunkcję niezbędną do czytelności wyodrębnionych danych.
-        """
-
-        options = {
-            "temperature": 0.2,
-            "top_k": 10,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
-
-        extracted_info = call_llm(
-            endpoint="generate",
-            input=summary,
-            system_message=system,
-            options=options
-        )
-        print("Ukończono ekstrakcję informacji.")
-
-    except Exception as e:
-        print(f"Error extracting info: {e}")
-
-    return extracted_info
-
-def base_extraction_formatter(raw_extraction_text):
-    """
-    Formats raw extraction text into a plain text list of key-value pairs using Ollama.
-
-    Args:
-        raw_extraction_text (str): The verbose text output containing extracted information.
-
-    Returns:
-        str: Formatted text as a plain list of key-value pairs (e.g., "Klucz: Wartość\nKlucz2: Wartość2").
-    """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w formatowaniu raportów z ekstrakcji informacji."
-
-    if not raw_extraction_text or not raw_extraction_text.strip():
+    full_text = "\n\n".join(page.get_text("text").strip() for page in doc).strip()
+    if not full_text:
+        logger.warning("Document has no extractable text; returning empty summary")
         return ""
 
-    try:
-        system = f"""
-        {introduction}
-        
-        **ZADANIE** 
-        Twoim zadaniem jest przekształcenie dostarczonego tekstu w listę par klucz-wartość, gdzie każda para jest w nowej linii.
+    if _estimate_tokens(full_text) <= config.SUMMARY_TOKEN_BUDGET:
+        logger.debug("Summary: single-pass (~%d tokens)", _estimate_tokens(full_text))
+        return strip_markdown(_summarize_text(full_text, final=True))
 
-        **OCZEKIWANE POLA I ICH FORMAT (Wypełnij, jeśli informacja jest dostępna w dostarczonym tekście):**
-        - `Typ dokumentu`: (np. 'Umowa', 'Protokół', 'Decyzja')
-        - `Data dokumentu`: (format RRRR-MM-DD, np. '2025-04-15')
-        - `Strony`: (np. 'ORLEN S.A., Firma X')
-        - `Przedmiot`: (krótki opis przedmiotu dokumentu/umowy)
-        - `Wartość`: (kwota, jeśli dotyczy, np. '10000 PLN')
-        - `Numer referencyjny`: (np. 'N4713000973')
+    char_budget = int(config.SUMMARY_TOKEN_BUDGET * config.CHARS_PER_TOKEN)
+    overlap = min(200, char_budget // 10)
 
-        **WYMAGANIA KRYTYCZNE (BEZWZGLĘDNIE OBOWIĄZUJĄCE):**
-        1.  **Odpowiedź musi być WYŁĄCZNIE listą par klucz-wartość, jedna para na linię.**
-        2.  Format każdej linii: `Klucz: Wartość` (np. `Data dokumentu: 2025-04-29`).
-        3.  Wypełnij tylko te pola, dla których informacja JEST ZAWARTA w dostarczonym tekście. Jeśli brak informacji, **pomiń całą linię dla tego klucza**.
-        4.  Użyj **dokładnych nazw kluczy** jak powyżej (`Typ dokumentu`, `Data dokumentu`, itd.).
-        5.  **Nie dodawaj żadnych wstępów, zakończeń, nagłówków, wyjaśnień, ani innych słów poza listą par.**
-        6.  Język odpowiedzi: polski.
+    chunks = create_text_parent_chunks(full_text, TEXT_SEPARATORS, char_budget, overlap)
+    logger.debug("Summary: map-reduce over %d chunk(s)", len(chunks))
+    combined = "\n\n".join(s for s in (_summarize_text(c, final=False) for c in chunks) if s.strip())
 
-        **PRZYKŁAD WYJŚCIA (dokładnie taki format, bez dodatków):**
-        Typ dokumentu: Protokół
-        Data dokumentu: 2025-04-29
-        Strony: ORLEN S.A. Oddział PGNIG w Sanoku
-        Przedmiot: Przegląd techniczny wózka jezdniowego
-        Numer referencyjny: N4713000973
-        """
-
-        options = {
-            "temperature": 0.2,
-            "top_k": 30, 
-            "top_p": 0.3, 
-            "num_predict": 500, 
-            "repeat_penalty": 1.1
-        }
-
-        formatted_output = call_llm(
-            endpoint="generate",
-            input=raw_extraction_text,
-            system_message=system,
-            options=options
-        )
-
-        print("Ukończono formatowanie do ekstrakcji informacji.")
-        return formatted_output
-
-    except Exception as e:
-        print(f"Error formatting to key-value pairs: {e}")
-        return raw_extraction_text 
-
-def check_confidential(summary):
-    """
-    Checks whether a legal document contains confidential information using Ollama.
-    
-    Args:
-        text (str): Full text of the document (not summary).
-        model (str): Ollama model name.
-        ollama_host (str): Base URL of the Ollama server.
-    
-    Returns:
-        str
-    """
-
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
+    for _ in range(_MAX_REDUCE_PASSES):
+        if _estimate_tokens(combined) <= config.SUMMARY_TOKEN_BUDGET:
+            break
+        sub_chunks = create_text_parent_chunks(combined, TEXT_SEPARATORS, char_budget, overlap)
+        logger.debug("Summary: reduce pass over %d chunk(s)", len(sub_chunks))
+        combined = "\n\n".join(s for s in (_summarize_text(c, final=False) for c in sub_chunks) if s.strip())
     else:
-        introduction = "Jesteś programem AI specjalizującym się w identyfikowaniu informacji wrażliwych w dokumentach."
-    
-    try:
-        system = f"""
-        {introduction}
-        
-        **ZADANIE** 
-        Your answers HAVE TO be in Polish only as well. Twoim zadaniem jest **ściśle określenie, czy dostarczony tekst dokumentu zawiera jakiekolwiek informacje wrażliwe**.
+        logger.warning("Summary did not converge under budget; final pass on truncated text")
+        combined = combined[:char_budget]
 
-        **INFORMACJE WRAŻLIWE OBEJMUJĄ:**
-        - Dane osobowe (np. imiona, nazwiska, adresy, daty urodzenia, PESEL, NIP, numery dowodów osobistych)
-        - Dane kontaktowe (np. adresy e-mail, numery telefonów)
-        - Dane finansowe (np. numery rachunków bankowych, kwoty wynagrodzeń, dane kart płatniczych)
-        - Numery identyfikacyjne (np. numery umów, sygnatury akt sądowych, numery rejestracyjne pojazdów)
-        - Informacje medyczne, poufne strategie biznesowe, tajemnice handlowe.
+    return strip_markdown(_summarize_text(combined, final=True))
 
-        **WYMAGANIA ODPOWIEDZI:**
-        - Odpowiedz **WYŁĄCZNIE JEDNYM SŁOWEM**: `TAK` (jeśli zawiera) lub `NIE` (jeśli nie zawiera).
-        - **Nie wolno** dodawać żadnych dodatkowych słów, wyjaśnień, interpunkcji ani komentarzy.
-        """
 
-        options = {
-            "temperature": 0.2,
-            "top_k": 10,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
+# --------------------------------------------------------------------------- #
+# Classification (structured, forced choice)
+# --------------------------------------------------------------------------- #
+_CATEGORY_BODY = (
+    "Przypisz dokument do jednej z dostępnych kategorii. Jeśli wybrana kategoria "
+    "ma podkategorie, wybierz również jedną z nich.\n\n"
+    "Dostępne kategorie:\n__CATEGORIES__"
+)
+_DEPARTMENT_BODY = (
+    "Przypisz dokument do jednego z dostępnych departamentów.\n\n"
+    "Dostępne departamenty:\n__DEPARTMENTS__"
+)
 
-        contains_confidential = call_llm(
-            endpoint="generate",
-            input=summary,
-            system_message=system,
-            options=options
-        )
 
-        print("Ukończono sprawdzenie informacji wrażliwych.")
+def _format_category_listing(categories: Dict[str, List[str]]) -> str:
+    """Render the category/subcategory options for the prompt."""
+    lines = []
+    for category, subs in categories.items():
+        lines.append(f"- {category}: {', '.join(subs)}" if subs else f"- {category}")
+    return "\n".join(lines)
 
-    except Exception as e:
-        print(f"Error checking for confidential info: {e}")
 
-    return contains_confidential
+def _department_names(departments: List[Union[str, Dict[str, Any]]]) -> List[str]:
+    """Extract department names from a list of names or {name, description} dicts."""
+    return [d["name"] if isinstance(d, dict) else d for d in departments]
 
-def other(prompt):
-    """
-    Sends a custom prompt to an Ollama model and returns the response.
-    
+
+def _format_department_listing(departments: List[Union[str, Dict[str, Any]]]) -> str:
+    """Render the department options (with descriptions when provided)."""
+    lines = []
+    for dept in departments:
+        if isinstance(dept, dict):
+            desc = dept.get("description")
+            lines.append(f"- {dept['name']}: {desc}" if desc else f"- {dept['name']}")
+        else:
+            lines.append(f"- {dept}")
+    return "\n".join(lines)
+
+
+def category_subcategory(
+    summary_text: str,
+    categories: Dict[str, List[str]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Assign the document to one category (+ subcategory when the category has any).
+
+    Runs the resolve -> coerce -> repair -> manual cascade. On total failure
+    returns ``(MANUAL_REVIEW, None)`` so the document is flagged for a human.
+
     Args:
-        prompt (str): Prompt to send to the model.
-        model (str): Name of the Ollama model to use.
-    
+        summary_text: The document summary.
+        categories: Mapping of category name -> subcategory names.
+
     Returns:
-        str: Model's response text.
+        ``(category, subcategory)``; subcategory is present only when the chosen
+        category has subcategories. ``(MANUAL_REVIEW, None)`` on unresolved.
     """
-    try:
-        options = {
-            "temperature": 0.2,
-            "top_k": 10,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
+    body = _CATEGORY_BODY.replace("__CATEGORIES__", _format_category_listing(categories))
+    schema = build_category_schema(categories)
+    initial = _run_llm_task(
+        _ROLE_CATEGORY, body, summary_text, _STRUCTURED_OPTIONS,
+        schema=schema, task_name="CATEGORY_SUBCATEGORY",
+    )
+    return _resolve_with_repair(
+        initial,
+        resolve_once=lambda raw: resolve_category(
+            raw, categories,
+            threshold=config.COERCION_THRESHOLD, tie_epsilon=config.COERCION_TIE_EPSILON,
+        ),
+        repair=lambda bad: _repair_call(_ROLE_CATEGORY, body, summary_text, bad, schema, "CATEGORY_SUBCATEGORY"),
+        max_attempts=config.STRUCTURED_MAX_REPAIRS,
+        sentinel=(MANUAL_REVIEW, None),
+        task_name="CATEGORY_SUBCATEGORY",
+    )
 
-        response = call_llm(
-            endpoint="generate",
-            input=prompt,
-            options=options
-        )
 
-        print("Ukończono task 'OTHER'.")
+def department_assignment(
+    summary_text: str,
+    departments: List[Union[str, Dict[str, Any]]],
+) -> Optional[str]:
+    """Assign the document to one of the provided departments.
 
-    except Exception as e:
-        print(f"Error generating response: {e}")
+    Runs the resolve -> coerce -> repair -> manual cascade.
 
-    return response
-
-def suggested_action(summary):
-    """
-    Sends a custom prompt to an Ollama model and returns the response.
-    
     Args:
-        text (str): document to send to the model.
-        model (str): Name of the Ollama model to use.
-    
+        summary_text: The document summary.
+        departments: Department names, or {name, description} dicts.
+
     Returns:
-        str: Model's response text.
+        The chosen department name, or ``MANUAL_REVIEW`` on unresolved.
     """
+    names = _department_names(departments)
+    body = _DEPARTMENT_BODY.replace("__DEPARTMENTS__", _format_department_listing(departments))
+    schema = build_department_schema(names)
+    initial = _run_llm_task(
+        _ROLE_DEPARTMENT, body, summary_text, _STRUCTURED_OPTIONS,
+        schema=schema, task_name="DEPARTMENT_ASSIGNMENT",
+    )
+    return _resolve_with_repair(
+        initial,
+        resolve_once=lambda raw: resolve_department(
+            raw, names,
+            threshold=config.COERCION_THRESHOLD, tie_epsilon=config.COERCION_TIE_EPSILON,
+        ),
+        repair=lambda bad: _repair_call(_ROLE_DEPARTMENT, body, summary_text, bad, schema, "DEPARTMENT_ASSIGNMENT"),
+        max_attempts=config.STRUCTURED_MAX_REPAIRS,
+        sentinel=MANUAL_REVIEW,
+        task_name="DEPARTMENT_ASSIGNMENT",
+    )
 
-    if "qwen" in config.MODEL.lower():
-        introduction = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. From now on, you will recieve instructions in Polish only. Your answers HAVE TO be in Polish only as well."
-    else:
-        introduction = "Jesteś programem AI specjalizującym się w proponowaniu działań na podstawie treści dokumentów."
 
-    try:
-        system = f"""
-        {introduction}
-        
-        **ZADANIE**
-        Your answers HAVE TO be in Polish only as well. Twoim zadaniem jest przeanalizowanie dostarczonego tekstu dokumentu i zaproponowanie konkretnych, adekwatnych działań, które należy podjąć w związku z jego treścią.
+# --------------------------------------------------------------------------- #
+# Extraction (structured; single call replaces extract + format)
+# --------------------------------------------------------------------------- #
+_EXTRACTION_BODY = (
+    "Wyodrębnij z dokumentu najważniejsze dane jako pary pole–wartość: daty, "
+    "nazwy stron, kwoty, terminy, numery referencyjne i kluczowe postanowienia. "
+    "Dla każdej istotnej informacji podaj nazwę pola i jego wartość."
+)
 
-        **WYMAGANIA ODPOWIEDZI:**
-        - Odpowiedź musi być **po polsku**, w formie **jednego, formalnego akapitu**.
-        - Propozycje działań powinny być **jasne, zwięzłe i praktyczne**.
-        - **Nie wolno** dodawać żadnych wstępów, zakończeń, komentarzy ani zbędnych słów. Zwróć **tylko** rekomendowane działania.
-        - Jeśli dokument nie wymaga oczywistych działań, wskaż, że dokument nie wymaga konkretnych akcji lub zawiera informacje do wiadomości.
-        """
-        
-        options = {
-            "temperature": 0.2,
-            "top_k": 10,
-            "top_p": 0.5,
-            "num_predict": 1000,
-            "repeat_penalty": 1.1
-        }
 
-        suggested_action = call_llm(
-            endpoint="generate",
-            input=summary,
-            system_message=system,
-            options=options
-        )
+def base_extraction(text: str) -> str:
+    """Extract key facts as field/value pairs and render them as text.
 
-        print("Ukończono generowanie zaleceń.")
+    A single structured call replaces the old extract-then-format chain. Open
+    field/value content has no closed vocabulary, so the cascade here is
+    parse+validate -> repair -> manual (no coercion step). An empty result is a
+    valid answer ("nothing found"), rendered as "".
 
-    except Exception as e:
-        print(f"Error generating suggestions: {e}")
-
-    return suggested_action
-
-def orlen_department_extraction_2(input_string):
-    """
-    Extracts department name from input text based on first occurrence.
-    Uses flexible matching to handle variations like "ODDZIAŁ PGNIG W SANOKU".
-    
     Args:
-        input_string (str): Text from document to analyze
-        
+        text: The document text/summary.
+
     Returns:
-        str: Name of the department that appears first in the text (with spaces)
+        "Field: Value" lines, "" if nothing was extracted, or ``MANUAL_REVIEW``
+        if the output could not be parsed/validated.
     """
-    
-    # Department patterns for flexible matching - key identifying parts
-    department_patterns = [
-        ("SANOKU", "ODDZIAŁWSANOKU"),
-        ("ZIELONEJGÓRZE", "ODDZIAŁWZIELONEJGÓRZE"),
-        ("ODOLANOWIE", "ODDZIAŁWODOLANOWIE"), 
-        ("GEOLOGIIIEKSPLOATACJI", "ODDZIAŁGEOLOGIIIEKSPLOATACJI"),
-        ("LABORATORIUMPOMIAROWOBADAWCZE", "POMIAROWOBADAWCZE"),
-        ("RATOWNICZASTACJAGÓRNICTWAOTWOROWE", "STACJAGÓRNICTWA")
-    ]
-    
-    # Maximum normalization - keep only letters and convert to uppercase
-    normalized_input = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', input_string).upper()
-    
-    # Find first occurrence of each department pattern
-    first_occurrences = []
-    
-    for pattern, dept_name in department_patterns:
-        # Find position of pattern in text
-        position = normalized_input.find(pattern)
-        if position != -1:  # If found
-            first_occurrences.append((position, dept_name))
-    
-    # If any departments were found, return the one that appears first
-    if first_occurrences:
-        # Sort by position and return the department name that appears first
-        first_occurrences.sort(key=lambda x: x[0])
-        return first_occurrences[0][1]
-    
-    # If no departments found, print message and return random one
-    print("best guess")
-    department_names = [dept[1] for dept in department_patterns]
-    return random.choice(department_names)
+    schema = extraction_schema()
+    initial = _run_llm_task(
+        _ROLE_EXTRACTION, _EXTRACTION_BODY, text, _STRUCTURED_OPTIONS,
+        schema=schema, task_name="BASE_EXTRACTION",
+    )
+    result = _resolve_with_repair(
+        initial,
+        resolve_once=lambda raw: validate_model(raw, ExtractionResult),
+        repair=lambda bad: _repair_call(_ROLE_EXTRACTION, _EXTRACTION_BODY, text, bad, schema, "BASE_EXTRACTION"),
+        max_attempts=config.STRUCTURED_MAX_REPAIRS,
+        sentinel=MANUAL_REVIEW,
+        task_name="BASE_EXTRACTION",
+    )
+    return result if isinstance(result, str) else render_extraction(result)
+
+
+# --------------------------------------------------------------------------- #
+# Confidentiality (structured; reports type categories, never the data)
+# --------------------------------------------------------------------------- #
+_CONFIDENTIAL_BODY = (
+    "Oceń, czy dokument zawiera dane wrażliwe, i wskaż wyłącznie ich TYPY — "
+    "nigdy samych danych. Wybierz spośród dozwolonych typów:\n"
+    "- first_names (imiona)\n"
+    "- surnames (nazwiska)\n"
+    "- id_numbers (PESEL, NIP, dowód)\n"
+    "- contact_data (e-mail, telefon, adres)\n"
+    "- financial_data (rachunki, kwoty, karty)\n"
+    "- medical_data (dane medyczne)\n"
+    "- confidential_decisions (decyzje poufne)\n"
+    "- trade_secrets (tajemnice handlowe)\n"
+    "- case_numbers (sygnatury akt)"
+)
+
+
+def check_confidential(text: str) -> str:
+    """Determine whether the document contains sensitive data and which types.
+
+    Runs the resolve -> coerce -> repair -> manual cascade. Crucially, an
+    unresolved result routes to ``MANUAL_REVIEW`` — it never silently defaults to
+    "NIE", which would be a fail-open on a safety-relevant field.
+
+    Args:
+        text: The document text/summary.
+
+    Returns:
+        Rendered Polish report (e.g. "Dane wrażliwe: TAK\\nWykryte typy:\\n- imiona"),
+        or ``MANUAL_REVIEW`` if the assessment could not be resolved.
+    """
+    schema = confidential_schema()
+    initial = _run_llm_task(
+        _ROLE_CONFIDENTIAL, _CONFIDENTIAL_BODY, text, _STRUCTURED_OPTIONS,
+        schema=schema, task_name="CHECK_CONFIDENTIAL",
+    )
+    result = _resolve_with_repair(
+        initial,
+        resolve_once=lambda raw: resolve_confidential(
+            raw, threshold=config.COERCION_THRESHOLD, tie_epsilon=config.COERCION_TIE_EPSILON,
+        ),
+        repair=lambda bad: _repair_call(_ROLE_CONFIDENTIAL, _CONFIDENTIAL_BODY, text, bad, schema, "CHECK_CONFIDENTIAL"),
+        max_attempts=config.STRUCTURED_MAX_REPAIRS,
+        sentinel=MANUAL_REVIEW,
+        task_name="CHECK_CONFIDENTIAL",
+    )
+    return result if isinstance(result, str) else render_confidential(result)
+
+
+# --------------------------------------------------------------------------- #
+# Recommendations & free-form (prose, markdown-stripped)
+# --------------------------------------------------------------------------- #
+_SUGGESTED_BODY = (
+    "Zaproponuj konkretne, praktyczne działania, które należy podjąć w związku z "
+    "treścią dokumentu. Odpowiedz jednym formalnym akapitem, po polsku. Jeśli "
+    "dokument nie wymaga działań, napisz to wprost."
+)
+
+
+def suggested_action(text: str) -> str:
+    """Propose concrete actions for the document (single paragraph).
+
+    Args:
+        text: The document text/summary.
+
+    Returns:
+        A markdown-free Polish paragraph.
+    """
+    raw = _run_llm_task(_ROLE_SUGGESTED, _SUGGESTED_BODY, text, _PRECISE_OPTIONS, task_name="SUGGESTED_ACTION")
+    return strip_markdown(raw)
+
+
+def other(prompt: str) -> str:
+    """Send a free-form prompt to the model (no system role).
+
+    Args:
+        prompt: The prompt to send.
+
+    Returns:
+        The model's response, markdown-stripped.
+    """
+    logger.debug("Running task OTHER")
+    return strip_markdown(call_llm(prompt=prompt, options=_PRECISE_OPTIONS))
