@@ -25,9 +25,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List
 
 import fitz  # PyMuPDF
+import hashlib
 import requests
 from flask import Flask, jsonify, request
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from waitress import serve
 
 import config
@@ -42,7 +43,13 @@ from tasks import (
     suggested_action,
     summary,
 )
-from utils import call_llm, convert_to_pdf, search_vectors, upload_to_milvus
+from utils import (
+    call_llm, 
+    convert_to_pdf, 
+    search_vectors, 
+    upload_to_milvus, 
+    fetch_document_text,
+)
 
 # Configure logging before anything else so module-level events are formatted.
 setup_logging()
@@ -58,6 +65,12 @@ logger = logging.getLogger(__name__)
 logger.info("Loading encoders '%s' (ingest + rag)", config.ENCODER_MODEL)
 encoder_ingest = SentenceTransformer(config.ENCODER_MODEL)
 encoder_rag = SentenceTransformer(config.ENCODER_MODEL)
+
+# Cross-encoder reranker, shared across query threads (serialized in search_vectors).
+reranker = None
+if config.RERANK_ENABLED:
+    logger.info("Loading reranker '%s'", config.RERANKER_MODEL)
+    reranker = CrossEncoder(config.RERANKER_MODEL)
 
 # Accepted upload content types (zip handling has been removed).
 CONTENT_TYPES = (
@@ -147,7 +160,8 @@ def run_rag_with_context(
             file_id = fragment.get("file_id", "N/A")
             contents = fragment.get("contents", "")
             if is_global_search:
-                formatted_context += f"--- Fragment z dokumentu o ID: {file_id} ---\n"
+                label = fragment.get("filename") or f"ID {file_id}"
+                formatted_context += f"--- Fragment z dokumentu: {label} ---\n"
             else:
                 formatted_context += f"--- Fragment {i + 1} ---\n"
             formatted_context += f"{contents}\n\n"
@@ -170,14 +184,17 @@ def run_rag_with_context(
         system_prompt += formatted_context
         system_prompt += (
             "INSTRUKCJE:\n"
-            "1. Odpowiedz na pytanie użytkownika w naturalny, uprzejmy i profesjonalny sposób.\n"
-            "2. Twoja odpowiedź musi być zwięzła i oparta wyłącznie na informacjach zawartych "
-            "w powyższym kontekście.\n"
+            "1. Odpowiadaj wyłącznie na podstawie informacji zawartych w powyższym "
+            "kontekście. Nie korzystaj z własnej wiedzy ani z informacji spoza kontekstu.\n"
+            "2. Jeżeli odpowiedź na pytanie nie znajduje się w kontekście, napisz wprost: "
+            "\"Nie znalazłem tej informacji w dostarczonych dokumentach.\" "
+            "Nie zgaduj i nie uzupełniaj brakujących danych.\n"
+            "3. Odpowiadaj zwięźle, naturalnie i profesjonalnie.\n"
         )
         if is_global_search:
             system_prompt += (
-                "3. Na końcu swojej odpowiedzi, wskaż identyfikatory (ID) dokumentów, z których "
-                "pochodzą informacje, np. 'Informacje pochodzą z dokumentów o ID: doc_001, doc_005.'\n"
+                "4. Na końcu odpowiedzi wskaż nazwy dokumentów, z których pochodzą "
+                "informacje, np. 'Informacje pochodzą z: umowa_najmu.pdf'.\n"
             )
 
         options = {"temperature": 0.2, "top_p": 0.5, "num_predict": 1024, "repeat_penalty": 1.1}
@@ -312,11 +329,17 @@ def create_task() -> Any:
 
         try:
             # Persist the upload to a temp file for processing.
+            upload = request.files["documentFile"]
+            filename = upload.filename or ""
             suffix = f'.{content_type.split("/")[-1]}'
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            request.files["documentFile"].save(temp_file.name)
+            upload.save(temp_file.name)
             temp_file.close()
             temp_file_path = temp_file.name
+
+            # SHA-256 of raw upload bytes (pre-conversion, stable) = content key.
+            with open(temp_file_path, "rb") as fh:
+                content_hash = hashlib.sha256(fh.read()).hexdigest()
 
             # Generate task ids up front and return them immediately.
             task_dicts = [{"taskType": task_type, "taskId": generate_task_id()} for task_type in tasks]
@@ -335,7 +358,7 @@ def create_task() -> Any:
                 # Open once to ingest into Milvus, once more to summarize (the
                 # first context manager closes the document), then run the tasks.
                 with open_doc() as doc:
-                    upload_to_milvus(doc, document_id, encoder_ingest)
+                    upload_to_milvus(doc, document_id, encoder_ingest, filename, content_hash)
                 with open_doc() as doc:
                     precomputed_summary = summary(doc)
                 _run_tasks_inline(precomputed_summary)
@@ -393,11 +416,28 @@ def sync_query() -> Any:
         query = data["query"]
 
         try:
-            context_fragments = search_vectors(query, encoder_rag, document_id)
+            is_global = document_id is None
+            used_full_document = False
+            context_fragments: List[Dict[str, Any]] = []
+
+            if document_id is not None:
+                # Full-document fast path: feed the whole doc if it fits the budget.
+                full_text = fetch_document_text(document_id)
+                doc_budget_chars = config.RAG_CONTEXT_TOKEN_BUDGET * config.CHARS_PER_TOKEN
+                if full_text and len(full_text) <= doc_budget_chars:
+                    context_fragments = [{"file_id": document_id, "contents": full_text}]
+                    used_full_document = True
+                    logger.info(
+                        "Query for document %s: full-document path (%d chars)",
+                        document_id, len(full_text),
+                    )
+
+            if not used_full_document:
+                context_fragments = search_vectors(query, encoder_rag, document_id, reranker=reranker)
+
             if not context_fragments:
                 return jsonify({"error": "No context found"}), 404
 
-            is_global = document_id is None
             response = run_rag_with_context(query, context_fragments, is_global)
 
             payload = {

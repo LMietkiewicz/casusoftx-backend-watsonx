@@ -106,6 +106,9 @@ def _build_schema(embedding_dim: int) -> "MilvusClient.create_schema":
                           retrieval fetches parents with a flat `parent_id in [...]`.
         hierarchy:        'parent' or 'child'.
         type:             'text' or 'table'.
+        filename:         the source file name (for display).
+        content_hash:     the source file's content hash (for deduplication).
+        is_search:        whether to include this row in search results.
         contents:         the chunk text; analyzer-enabled to feed BM25.
         dense_embedding:  semantic vector (zero placeholder for parent rows).
         sparse_embedding: BM25 vector produced from `contents` by the function.
@@ -133,6 +136,9 @@ def _build_schema(embedding_dim: int) -> "MilvusClient.create_schema":
     schema.add_field(field_name="parent_id", datatype=DataType.INT64)
     schema.add_field(field_name="hierarchy", datatype=DataType.VARCHAR, max_length=16)
     schema.add_field(field_name="type", datatype=DataType.VARCHAR, max_length=16)
+    schema.add_field(field_name="filename", datatype=DataType.VARCHAR, max_length=512)
+    schema.add_field(field_name="content_hash", datatype=DataType.VARCHAR, max_length=64)
+    schema.add_field(field_name="is_search", datatype=DataType.BOOL)
     schema.add_field(
         field_name="contents",
         datatype=DataType.VARCHAR,
@@ -188,6 +194,11 @@ def _build_index_params() -> "MilvusClient.prepare_index_params":
             "bm25_b": 0.75,
         },
     )
+
+    # Scalar indexes for hot-path filter fields (else linear scans).
+    index_params.add_index(field_name="file_id", index_type="INVERTED")
+    index_params.add_index(field_name="content_hash", index_type="INVERTED")
+    index_params.add_index(field_name="is_search", index_type="INVERTED")
 
     return index_params
 

@@ -28,3 +28,6 @@ pydantic==2.13.4
 python-dotenv==1.2.2
 
 # Removed: python-docx — not imported anywhere (Gotenberg handles conversion).
+
+# Run the following to uninstall the hf_xet package - reccomended.
+# pip uninstall hf_xet -y

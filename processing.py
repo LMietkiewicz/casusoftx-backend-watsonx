@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # per deployment without a code change.
 TEXT_SEPARATORS: List[str] = ["\n\n", "\n", ". "]
 PARENT_CHUNK_SIZE: int = 1500
-PARENT_CHUNK_OVERLAP: int = 200
+PARENT_CHUNK_OVERLAP: int = 0 #DO NOT CHANGE — needs adjusting for full-text search, which is not implemented yet.
 CHILD_CHUNK_SIZE: int = 400
 
 # Polish abbreviations whose trailing period must NOT be treated as a sentence
@@ -125,34 +125,18 @@ def _apply_overlap(chunks: List[str], overlap: int) -> List[str]:
     return result
 
 
-def create_text_parent_chunks(
+def _split_text_recursive(
     text: str,
     separators: List[str],
     chunk_size: int,
-    chunk_overlap: int,
 ) -> List[str]:
-    """Recursively split text into large, overlapping parent chunks.
-
-    Tries separators in priority order, greedily merging pieces up to
-    ``chunk_size`` and recursing into any single piece that is still too large.
-    Overlap is applied between the resulting chunks.
-
-    Args:
-        text: Input text.
-        separators: Separators to try, highest priority first.
-        chunk_size: Maximum chunk size in characters (before overlap).
-        chunk_overlap: Overlap in characters between consecutive chunks.
-
-    Returns:
-        Ordered parent chunks.
-    """
+    """Recursively split text into <=chunk_size pieces. No overlap applied here."""
     text = text.strip()
     if not text:
         return []
     if len(text) <= chunk_size:
         return [text]
 
-    # Pick the first separator that actually occurs in the text.
     separator, remaining = "", []
     for i, sep in enumerate(separators):
         if sep == "" or sep in text:
@@ -160,21 +144,18 @@ def create_text_parent_chunks(
             break
 
     if separator == "":
-        return _hard_split(text, chunk_size, chunk_overlap)
+        # Hard split with NO overlap; overlap is applied once, later.
+        return _hard_split(text, chunk_size, overlap=0)
 
     merged: List[str] = []
     current = ""
     for piece in text.split(separator):
-        # A single piece larger than the budget: flush, then recurse into it.
         if len(piece) > chunk_size:
             if current.strip():
                 merged.append(current.strip())
                 current = ""
-            merged.extend(
-                create_text_parent_chunks(piece, remaining, chunk_size, chunk_overlap)
-            )
+            merged.extend(_split_text_recursive(piece, remaining, chunk_size))
             continue
-
         candidate = f"{current}{separator}{piece}" if current else piece
         if len(candidate) <= chunk_size:
             current = candidate
@@ -186,7 +167,18 @@ def create_text_parent_chunks(
     if current.strip():
         merged.append(current.strip())
 
-    return _apply_overlap(merged, chunk_overlap)
+    return merged
+
+
+def create_text_parent_chunks(
+    text: str,
+    separators: List[str],
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[str]:
+    """Split text into large parent chunks, then apply overlap exactly once."""
+    chunks = _split_text_recursive(text, separators, chunk_size)
+    return _apply_overlap(chunks, chunk_overlap)
 
 
 # --------------------------------------------------------------------------- #
@@ -426,6 +418,8 @@ def processing_pipeline(
     doc: "fitz.Document",
     file_id: int,
     model: "SentenceTransformer",
+    filename: str = "",
+    content_hash: str = "",
     show_progress: bool = False,
 ) -> List[Dict[str, Any]]:
     """Process a PDF into Milvus-ready parent and child rows.
@@ -434,6 +428,8 @@ def processing_pipeline(
         doc: An open PyMuPDF document.
         file_id: Unique document id (used for global parent-id composition).
         model: Sentence-transformer encoder for dense child embeddings.
+        filename: The name of the file.
+        content_hash: The hash of the file's content.
         show_progress: Whether the encoder shows a progress bar (off in prod).
 
     Returns:
@@ -504,6 +500,9 @@ def processing_pipeline(
                 "hierarchy": "parent",
                 "type": pair["type"],
                 "contents": pair["parent_contents"],
+                "filename": filename,
+                "content_hash": content_hash,
+                "is_search": True,
                 "dense_embedding": parent_placeholder,
             }
         )
@@ -524,6 +523,9 @@ def processing_pipeline(
                 "hierarchy": "child",
                 "type": pair["type"],
                 "contents": pair["child_contents"],
+                "filename": filename,
+                "content_hash": content_hash,
+                "is_search": True,
                 "dense_embedding": embedding.tolist(),
             }
         )

@@ -28,10 +28,13 @@ if TYPE_CHECKING:  # type-only; these objects are passed in, never imported at r
 
 logger = logging.getLogger(__name__)
 
-# Serializes forward passes through the shared RAG query encoder, which several
-# request threads may hit at once. Document-ingestion embedding uses a separate
+# Serializes forward passes through the shared RAG query encoder and reranker, which 
+# several request threads may hit at once. Document-ingestion embedding uses a separate
 # encoder and is single-threaded, so it is not guarded here.
 _rag_encode_lock = threading.Lock()
+
+# Serializes the shared cross-encoder reranker across concurrent query threads.
+_rerank_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +253,53 @@ def strip_markdown(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Query-side helpers: dedup alias resolution & full-document reassembly
+# --------------------------------------------------------------------------- #
+def resolve_document_scope(file_id: int) -> Optional[str]:
+    """Filter scoping a query to one document's real chunks, following the alias.
+
+    Real document -> ``file_id == F``; dummy alias -> the canonical doc sharing
+    its content_hash. None if the id is unknown.
+    """
+    client = get_milvus_client()
+    rows = client.query(
+        collection_name=config.MILVUS_COLLECTION,
+        filter=f"file_id == {int(file_id)}",
+        output_fields=["is_search", "content_hash"],
+        limit=1,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    if row.get("is_search"):
+        return f"file_id == {int(file_id)}"
+    content_hash = row.get("content_hash", "")
+    return f'content_hash == "{content_hash}" and is_search == true'
+
+
+def fetch_document_text(file_id: int) -> str:
+    """Reassemble a document's full text from its text parents, in reading order.
+
+    Text parents tile the document and parent_id encodes order; table parents are
+    excluded (their cell text is already inline). Follows the dedup alias.
+    """
+    scope = resolve_document_scope(file_id)
+    if scope is None:
+        return ""
+    client = get_milvus_client()
+    rows = client.query(
+        collection_name=config.MILVUS_COLLECTION,
+        filter=f'({scope}) and hierarchy == "parent" and type == "text"',
+        output_fields=["parent_id", "contents"],
+        limit=16384,
+    )
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: r["parent_id"])
+    return "\n".join(r["contents"] for r in rows)
+
+
+# --------------------------------------------------------------------------- #
 # Milvus hybrid search
 # --------------------------------------------------------------------------- #
 def _milvus_read(operation: Callable[[MilvusClient], Any]) -> Any:
@@ -278,59 +328,54 @@ def search_vectors(
     encoder: "SentenceTransformer",
     document_id: Optional[int] = None,
     top_k: int = 10,
+    reranker: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    """Hybrid (dense + BM25) search over child chunks, returning parent context.
+    """Hybrid (dense + BM25) search over children, returning reranked parents.
 
-    Matches children with reciprocal-rank fusion, then fetches their parent
-    chunks by globally-unique ``parent_id`` (so no cross-document contamination).
-
-    Args:
-        query_text: The natural-language query.
-        encoder: Sentence-transformer used for the dense query vector.
-        document_id: If given, restrict the search to one document.
-        top_k: Number of fused child hits to keep.
-
-    Returns:
-        Parent chunk dicts (``parent_id``, ``contents``, ``file_id``, ``type``),
-        or an empty list if nothing matched.
+    Single-document searches follow the dedup alias; global searches are pinned
+    to canonical (is_search) chunks. With a reranker, a wide candidate pool is
+    pulled and re-scored, keeping RERANK_TOP_K.
     """
     document_id = int(document_id) if document_id is not None else None
-    # The RAG encoder is shared across concurrent query threads, so serialize the
-    # forward pass. Held only for one short query embed (microseconds), never
-    # behind document-ingestion embedding (that uses a separate, ingest-owned
-    # encoder), so RAG latency stays low under ingestion load.
-    with _rag_encode_lock:
-        query_embedding = encoder.encode(query_text).tolist()
+    use_rerank = config.RERANK_ENABLED and reranker is not None
+    candidate_k = config.RERANK_CANDIDATES if use_rerank else top_k
 
-    child_filter = "hierarchy == 'child'"
+    # mmlw-retrieval: dense query needs the query prefix; BM25 gets raw text.
+    with _rag_encode_lock:
+        query_embedding = encoder.encode(config.QUERY_PREFIX + query_text).tolist()
+
     if document_id is not None:
-        child_filter += f" and file_id == {document_id}"
+        scope = resolve_document_scope(document_id)
+        if scope is None:
+            logger.debug("search: document %s unknown; no results", document_id)
+            return []
+        child_filter = f"hierarchy == 'child' and ({scope})"
+    else:
+        child_filter = "hierarchy == 'child' and is_search == true"
 
     def _search(client: MilvusClient) -> List[Dict[str, Any]]:
         dense_req = AnnSearchRequest(
             data=[query_embedding],
             anns_field="dense_embedding",
             param={"metric_type": "IP"},
-            limit=top_k * 2,  # over-fetch candidates for better fusion
+            limit=candidate_k * 2,
             expr=child_filter,
         )
         sparse_req = AnnSearchRequest(
-            data=[query_text],  # Milvus builds the BM25 sparse vector from text
+            data=[query_text],
             anns_field="sparse_embedding",
             param={"metric_type": "BM25"},
-            limit=top_k * 2,
+            limit=candidate_k * 2,
             expr=child_filter,
         )
         child_hits = client.hybrid_search(
             collection_name=config.MILVUS_COLLECTION,
             reqs=[dense_req, sparse_req],
             ranker=RRFRanker(),
-            limit=top_k,
+            limit=candidate_k,
             output_fields=["parent_id"],
             consistency_level="Strong",
         )
-
-        # Collect the (globally unique) parent ids of the matched children.
         parent_ids = {
             hit.get("entity", {}).get("parent_id")
             for hits in child_hits
@@ -339,31 +384,42 @@ def search_vectors(
         }
         if not parent_ids:
             return []
-
-        # Flat fetch: parent_id is globally unique, so no file_id scoping needed.
-        parent_filter = f"parent_id in {list(parent_ids)} and hierarchy == 'parent'"
+        parent_filter = (
+            f"parent_id in {list(parent_ids)} and hierarchy == 'parent' and is_search == true"
+        )
         return client.query(
             collection_name=config.MILVUS_COLLECTION,
             filter=parent_filter,
-            output_fields=["parent_id", "contents", "file_id", "type"],
+            output_fields=["parent_id", "contents", "file_id", "type", "filename"],
             consistency_level="Strong",
         )
 
-    results = _milvus_read(_search)
+    parents = _milvus_read(_search)
+
+    if use_rerank and parents:
+        with _rerank_lock:
+            scores = reranker.predict([(query_text, p["contents"]) for p in parents])
+        ranked = sorted(zip(parents, scores), key=lambda ps: float(ps[1]), reverse=True)
+        parents = [p for p, _ in ranked[: config.RERANK_TOP_K]]
+
     logger.debug(
-        "search %s (doc=%s) -> %d parent fragment(s)",
-        preview(query_text, 120), document_id, len(results),
+        "search %s (doc=%s, rerank=%s) -> %d parent fragment(s)",
+        preview(query_text, 120), document_id, use_rerank, len(parents),
     )
-    return results
+    return parents
 
 
-def upload_to_milvus(doc: "fitz.Document", file_id: int, model: "SentenceTransformer") -> None:
-    """Process a document and insert its chunks into Milvus, if not already present.
+def upload_to_milvus(
+    doc: "fitz.Document",
+    file_id: int,
+    model: "SentenceTransformer",
+    filename: str = "",
+    content_hash: str = "",
+) -> None:
+    """Ingest a document into Milvus, with deduplication.
 
-    Args:
-        doc: An open PyMuPDF document.
-        file_id: Unique document id.
-        model: Sentence-transformer encoder.
+    1. Same file_id present -> skip. 2. Same content_hash under another id ->
+    write one dummy alias row (is_search=False). 3. New content -> full ingest.
     """
     file_id = int(file_id)
     try:
@@ -376,18 +432,39 @@ def upload_to_milvus(doc: "fitz.Document", file_id: int, model: "SentenceTransfo
             )
             return
 
-        existing = client.query(
+        existing_id = client.query(
             collection_name=config.MILVUS_COLLECTION,
             filter=f"file_id == {file_id}",
             output_fields=["file_id"],
             limit=1,
         )
-        if existing:
+        if existing_id:
             logger.info("File %s already present in collection; skipping upload", file_id)
             return
 
+        if content_hash:
+            existing_hash = client.query(
+                collection_name=config.MILVUS_COLLECTION,
+                filter=f'content_hash == "{content_hash}" and is_search == true',
+                output_fields=["file_id"],
+                limit=1,
+            )
+            if existing_hash:
+                canonical = existing_hash[0].get("file_id")
+                logger.info(
+                    "Content of file %s already present (hash match, canonical=%s); "
+                    "writing dummy alias row instead of re-ingesting",
+                    file_id, canonical,
+                )
+                embedding_dim = model.get_sentence_embedding_dimension()
+                client.insert(
+                    collection_name=config.MILVUS_COLLECTION,
+                    data=[_dummy_alias_row(file_id, filename, content_hash, embedding_dim)],
+                )
+                return
+
         logger.info("Processing file %s for upload", file_id)
-        rows = processing_pipeline(doc, file_id, model)
+        rows = processing_pipeline(doc, file_id, model, filename=filename, content_hash=content_hash)
         if not rows:
             logger.warning("Processing produced no rows for file %s; nothing to upload", file_id)
             return
@@ -396,10 +473,25 @@ def upload_to_milvus(doc: "fitz.Document", file_id: int, model: "SentenceTransfo
         logger.info("Inserted %s record(s) for file %s", result["insert_count"], file_id)
 
     except Exception:
-        # Clear a possibly-stale connection so later operations reconnect, but do
-        # NOT retry: insert is not idempotent and a blind retry could duplicate rows.
         reset_client()
         raise
+
+
+def _dummy_alias_row(file_id: int, filename: str, content_hash: str, embedding_dim: int) -> Dict[str, Any]:
+    """Non-searchable alias row for a content-duplicate document (resolves to the
+    canonical copy via content_hash). is_search=False excludes it from all queries.
+    """
+    return {
+        "file_id": file_id,
+        "parent_id": file_id,  # arbitrary; never queried
+        "hierarchy": "parent",
+        "type": "text",
+        "contents": "x",       # BM25 needs a token; never searched
+        "filename": filename,
+        "content_hash": content_hash,
+        "is_search": False,
+        "dense_embedding": [0.0] * embedding_dim,
+    }
 
 
 # --------------------------------------------------------------------------- #

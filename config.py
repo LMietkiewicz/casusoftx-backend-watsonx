@@ -192,6 +192,9 @@ def _resolve_encoder() -> str:
 
 ENCODER_MODEL: str = _resolve_encoder()
 
+# Dense-query prefix for mmlw-retrieval (queries only; never BM25/passages).
+QUERY_PREFIX: str = _get_str("QUERY_PREFIX", "zapytanie: ")
+
 # Base URL of the inference backend (Ollama host or watsonx endpoint).
 INFERENCE_PROVIDER_BASE_URL: Optional[str] = _get_str("INFERENCE_PROVIDER_BASE_URL")
 
@@ -235,7 +238,7 @@ GOTENBERG_TIMEOUT: int = _get_int("GOTENBERG_TIMEOUT", 60)
 # window degrades summary quality (lost-in-the-middle), so this is a quality
 # knob, not a capacity ceiling. Tuned independently per provider.
 SUMMARY_TOKEN_BUDGET_OLLAMA: int = _get_int("SUMMARY_TOKEN_BUDGET_OLLAMA", 3000)
-SUMMARY_TOKEN_BUDGET_WATSONX: int = _get_int("SUMMARY_TOKEN_BUDGET_WATSONX", 4000)
+SUMMARY_TOKEN_BUDGET_WATSONX: int = _get_int("SUMMARY_TOKEN_BUDGET_WATSONX", 20000)
 
 # Active budget resolved against the selected provider.
 SUMMARY_TOKEN_BUDGET: int = (
@@ -246,6 +249,37 @@ SUMMARY_TOKEN_BUDGET: int = (
 # a character budget for the char-based recursive chunker. ~3.5 is a reasonable
 # approximation for Polish text; lower it to be more conservative.
 CHARS_PER_TOKEN: float = float(_get_str("CHARS_PER_TOKEN", "3.5"))
+
+# --------------------------------------------------------------------------- #
+# RAG retrieval & context budgets
+# --------------------------------------------------------------------------- #
+# Full-document fast path: a single-document query whose estimated token count
+# fits this budget is fed whole (no chunked retrieval). 80% of the active
+# model's context window; the 20% is headroom for prompt + answer.
+# >>> FILL IN the real *served* context windows (watsonx may cap below native).
+_QWEN_CONTEXT_WINDOW: int = _get_int("QWEN_CONTEXT_WINDOW", 30000)    
+_LLAMA_CONTEXT_WINDOW: int = _get_int("LLAMA_CONTEXT_WINDOW", 131000)   
+_UNKNOWN_CONTEXT_BUDGET: int = _get_int("UNKNOWN_CONTEXT_BUDGET", 10000)
+
+
+def _resolve_context_budget(model: str) -> int:
+    m = (model or "").lower()
+    if "qwen" in m:
+        return int(_QWEN_CONTEXT_WINDOW * 0.8)
+    if "llama" in m:
+        return int(_LLAMA_CONTEXT_WINDOW * 0.8)
+    return _UNKNOWN_CONTEXT_BUDGET
+
+
+RAG_CONTEXT_TOKEN_BUDGET: int = _resolve_context_budget(MODEL)
+
+# --------------------------------------------------------------------------- #
+# Reranker
+# --------------------------------------------------------------------------- #
+RERANK_ENABLED: bool = _get_bool("RERANK_ENABLED", True)
+RERANKER_MODEL: str = _get_str("RERANKER_MODEL", "sdadas/polish-reranker-roberta-v3")
+RERANK_CANDIDATES: int = _get_int("RERANK_CANDIDATES", 50)
+RERANK_TOP_K: int = _get_int("RERANK_TOP_K", 10)
 
 # --------------------------------------------------------------------------- #
 # HTTP server & concurrency
