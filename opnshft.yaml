@@ -38,7 +38,7 @@ data:
 
   # Milvus is external and managed by the platform team. This is the only
   # line that changes when it moves.
-  MILVUS_HOST: "CHANGE_ME"
+  MILVUS_HOST: "CHANGE_ME"  
   MILVUS_PORT: "19530"
   MILVUS_COLLECTION: "file_embeddings"
 
@@ -96,7 +96,7 @@ spec:
       containers:
         - name: casusoftx-backend
           # CHANGE THIS to your pushed image
-          image: quay.io/YOUR_USERNAME/casusoftx-backend:ocp
+          image: quay.io/lukasz_mietkiewicz/csx-backend-tests:main
           imagePullPolicy: Always
 
           # Config is injected at runtime, never baked into the image.
@@ -258,4 +258,3 @@ spec:
     # Your waitress server stays HTTP-only; the platform handles certs.
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
-    
