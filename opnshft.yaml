@@ -258,3 +258,4 @@ spec:
     # Your waitress server stays HTTP-only; the platform handles certs.
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
+    
