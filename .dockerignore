@@ -11,6 +11,7 @@ secrets/
 # Version control
 .git
 .gitignore
+.gitattributes
 
 # Python cruft — also keeps the build cache from busting on local test runs
 __pycache__/
@@ -41,7 +42,3 @@ Thumbs.db
 *.md
 !README.md
 .github/
-docker-compose*.yml
-Dockerfile
-opnshft.Dockerfile
-openshift-manifests.yaml
