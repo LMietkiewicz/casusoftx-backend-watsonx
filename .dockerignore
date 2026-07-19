@@ -1,0 +1,47 @@
+# Secrets — these must NEVER enter an image layer. Layers are immutable, so a
+# later `RUN rm .env` does not remove it; anyone who pulls the image can
+# recover the file from the layer it was added in.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Version control
+.git
+.gitignore
+
+# Python cruft — also keeps the build cache from busting on local test runs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local model/data caches — these can be many GB and would be copied into the
+# image on top of the models already baked in by the build.
+.cache/
+hf_cache/
+data/
+uploads/
+*.db
+*.sqlite3
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs and CI don't belong in a runtime image
+*.md
+!README.md
+.github/
+docker-compose*.yml
+Dockerfile
+opnshft.Dockerfile
+openshift-manifests.yaml

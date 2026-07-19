@@ -1,0 +1,260 @@
+# =============================================================================
+# OpenShift manifests — casusoftx-backend 
+#
+# NOTE FOR DEPLOYERS: do NOT add securityContext.runAsUser or runAsGroup.
+# The restricted-v2 SCC uses the MustRunAsRange strategy: it assigns an
+# arbitrary UID from the namespace's allocated range, with GID 0, and
+# validates any runAsUser you set against that range. A value outside the
+# range is rejected at admission. Since the range differs per namespace and
+# per cluster, there is no portable value to hardcode — omit it and let the
+# SCC assign. The image is built to accommodate this (files group-0 owned,
+# HF_HOME on a group-writable path).
+#
+# Apply order: ConfigMap -> Secret -> Deployment -> Service -> Route
+# Console: use the "+" icon (top right) -> Import YAML -> paste this whole file
+# CLI:     oc apply -f openshift-manifests.yaml
+# =============================================================================
+
+# Non-secret configuration. This is the Kubernetes equivalent of your .env
+# file, minus anything sensitive. Values are strings — always quote them, or
+# YAML will turn 19530 into an int and "true" into a bool, and the injection
+# will fail with a type error.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: casusoftx-backend-config
+data:
+  # --- inference backend ---
+  PROVIDER: "watsonx"                              # ollama | watsonx
+  INFERENCE_PROVIDER_BASE_URL: "CHANGE_ME"        # ollama needs a reachable URL —
+                                                  # localhost:11434 does NOT exist
+                                                  # inside the pod. See note below.
+
+  # --- infrastructure ---
+  # Gotenberg is a sidecar: same pod, same network namespace, so localhost
+  # works and no Service is needed. This overrides your compose-era default
+  # of http://gotenberg:3000.
+  GOTENBERG_URL: "http://localhost:3000"
+
+  # Milvus is external and managed by the platform team. This is the only
+  # line that changes when it moves.
+  MILVUS_HOST: "CHANGE_ME"
+  MILVUS_PORT: "19530"
+  MILVUS_COLLECTION: "file_embeddings"
+
+  PORT: "5000"
+
+  # --- keep these off ---
+  # DEBUG writes confidential document content and raw LLM I/O to logs, which
+  # in a cluster are collected centrally and readable by anyone with log
+  # access to the namespace. Much worse than on a laptop.
+  DEBUG: "false"
+  ACKNOWLEDGE_SENSITIVE_LOGGING: "false"
+  LOG_LEVEL: "INFO"
+
+---
+# Secrets. Only needed when PROVIDER=watsonx.
+#
+# WARNING: Kubernetes Secrets are base64-ENCODED, not encrypted. Anyone with
+# read access to the namespace can decode them trivially. They exist to keep
+# credentials out of your image and out of Git — not to provide real secrecy.
+#
+# Do NOT commit this object with real values filled in. Create it imperatively
+# instead, so the credential never touches a file:
+#
+#   oc create secret generic casusoftx-backend-secrets \
+#     --from-literal=API_KEY='...' \
+#     --from-literal=PROJECT_ID='...'
+#
+# stringData (vs data) takes plain text and encodes it for you.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: casusoftx-backend-secrets
+type: Opaque
+stringData:
+  API_KEY: "CHANGE_ME"
+  PROJECT_ID: "CHANGE_ME"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: casusoftx-backend
+  labels:
+    app: casusoftx-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: casusoftx-backend
+  template:
+    metadata:
+      labels:
+        app: casusoftx-backend
+    spec:
+      containers:
+        - name: casusoftx-backend
+          # CHANGE THIS to your pushed image
+          image: quay.io/YOUR_USERNAME/casusoftx-backend:ocp
+          imagePullPolicy: Always
+
+          # Config is injected at runtime, never baked into the image.
+          # envFrom pulls every key from these objects in as an env var.
+          # Order matters: later entries win, so the Secret overrides the
+          # ConfigMap if a key appears in both.
+          envFrom:
+            - configMapRef:
+                name: casusoftx-backend-config
+            - secretRef:
+                name: casusoftx-backend-secrets
+                optional: true    # not needed when PROVIDER=ollama
+
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+
+          # NO securityContext HERE. See note at top of file.
+
+          resources:
+            requests:
+              memory: "7Gi"
+              cpu: "1"
+            limits:
+              # Sandbox quota is 14Gi / 3 cores total. Two roberta-large models
+              # plus torch runtime sit around 6-7Gi resident.
+              memory: "9Gi"
+              cpu: "2"
+
+          # Model load from the baked-in cache takes 30-90s. Without a
+          # startupProbe the livenessProbe kills the pod mid-warmup and you
+          # get a restart loop with no useful error.
+          startupProbe:
+            httpGet:
+              path: /            # CHANGE to a real endpoint if / 404s
+              port: 5000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30   # allows up to ~5 min to come up
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            periodSeconds: 10
+            timeoutSeconds: 5
+
+        # --- Gotenberg sidecar ------------------------------------------
+        # Stateless, 1:1 with the app, no persistence — a legitimate sidecar.
+        # Shares the pod's network namespace, so the app reaches it at
+        # localhost:3000.
+        #
+        # The XDG_* vars below are NOT optional. Gotenberg's Chromium and
+        # LibreOffice write to XDG paths that resolve under a root-owned
+        # home dir, which the arbitrary UID cannot write. Upstream issue
+        # gotenberg/gotenberg#1049 is open and unfixed; redirecting XDG to
+        # /tmp (mode 1777) is the documented workaround that avoids needing
+        # a custom image.
+        - name: gotenberg
+          image: gotenberg/gotenberg:8
+          imagePullPolicy: IfNotPresent
+
+          env:
+            - name: XDG_CONFIG_HOME
+              value: /tmp/xdg-config
+            - name: XDG_CACHE_HOME
+              value: /tmp/xdg-cache
+            - name: XDG_DATA_HOME
+              value: /tmp/xdg-data
+            - name: HOME
+              value: /tmp
+
+          ports:
+            - name: gotenberg
+              containerPort: 3000
+              protocol: TCP
+
+          # NO securityContext here either — same reason as above.
+
+          # Chromium is memory-hungry and will OOMKill under a tight limit.
+          # An OOMKill in ANY container restarts the WHOLE pod, so a
+          # starved sidecar takes your app down with it.
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "100m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+      # emptyDir = scratch space created with the pod, deleted with it.
+      # Not persistence — just a writable scratch disk. The container's own
+      # /tmp would work too, but an explicit emptyDir is guaranteed
+      # writable regardless of the image's permissions.
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: casusoftx-backend
+  labels:
+    app: casusoftx-backend
+spec:
+  selector:
+    app: casusoftx-backend
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+
+---
+# Route is OpenShift-specific — this is what replaces Ingress.
+# It gets a hostname automatically; no need to specify spec.host.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: casusoftx-backend
+  labels:
+    app: casusoftx-backend
+  annotations:
+    # The router's default timeout is 30s. A RAG query doing retrieval plus
+    # cross-encoder reranking can exceed that, and the router returns 504
+    # while the app is still working — it looks like an app failure but is
+    # not. Units are required (us/ms/s/m/h/d); a bare number means ms.
+    haproxy.router.openshift.io/timeout: 120s
+spec:
+  to:
+    kind: Service
+    name: casusoftx-backend
+  port:
+    targetPort: http
+  tls:
+    # edge = TLS terminates at the router, plain HTTP to your pod.
+    # Your waitress server stays HTTP-only; the platform handles certs.
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
