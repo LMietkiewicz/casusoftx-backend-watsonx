@@ -1,16 +1,19 @@
 """backend.py - Flask application for document-processing tasks and RAG queries.
 
-Exposes two endpoints:
+Exposes:
 
-* ``POST /api/task``  - accepts a document upload plus a list of tasks, returns
-  generated task ids immediately, and processes the document in the background,
-  delivering each task result via the success/error callback URLs.
-* ``POST /api/query`` - synchronous RAG query over previously-ingested documents.
-* ``GET  /health``    - liveness probe.
+* ``POST   /api/task``                  - accepts a document uuid plus a list of tasks,
+  returns generated task ids immediately, then pulls the document from CSX
+  storage and processes it in the background, delivering each task result via
+  the success/error callback URLs.
+* ``POST   /api/query``                 - synchronous RAG query over ingested documents.
+* ``DELETE /ai/document/<document_id>`` - removes a document's data from Milvus.
+* ``GET    /health``                    - liveness probe.
 
-Ingestion (``upload_to_milvus``), retrieval (``search_vectors``), conversion
-(``convert_to_pdf``) and the per-task LLM operations live in their own modules;
-this file is the HTTP layer, task routing, and background orchestration.
+Retrieval from CSX storage (``fetch_document``), ingestion (``upload_to_milvus``),
+search (``search_vectors``), conversion (``convert_to_pdf``) and the per-task LLM
+operations live in their own modules; this file is the HTTP layer, task routing,
+and background orchestration.
 """
 from __future__ import annotations
 
@@ -44,11 +47,14 @@ from tasks import (
     summary,
 )
 from utils import (
-    call_llm, 
-    convert_to_pdf, 
-    search_vectors, 
-    upload_to_milvus, 
+    call_llm,
+    convert_to_pdf,
+    delete_document,
+    document_exists,
+    fetch_document,
     fetch_document_text,
+    search_vectors,
+    upload_to_milvus,
 )
 
 # Configure logging before anything else so module-level events are formatted.
@@ -84,9 +90,6 @@ CONTENT_TYPES = (
     "application/xml",
     "text/xml",
 )
-
-# Office/text formats that must be converted to PDF before processing.
-_OFFICE_CONTENT_TYPES = frozenset(CONTENT_TYPES) - {"application/pdf"}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
@@ -157,10 +160,11 @@ def run_rag_with_context(
     try:
         formatted_context = ""
         for i, fragment in enumerate(context_fragments):
-            file_id = fragment.get("file_id", "N/A")
             contents = fragment.get("contents", "")
             if is_global_search:
-                label = fragment.get("filename") or f"ID {file_id}"
+                # Chunk rows are owned by content, not by a uuid, so filename is
+                # the only per-fragment identifier available here.
+                label = fragment.get("filename") or f"dokument {fragment.get('content_hash', '')[:8]}"
                 formatted_context += f"--- Fragment z dokumentu: {label} ---\n"
             else:
                 formatted_context += f"--- Fragment {i + 1} ---\n"
@@ -212,7 +216,7 @@ def run_rag_with_context(
 # Task dispatch
 # --------------------------------------------------------------------------- #
 def handle_task(
-    document_id: int,
+    file_uuid: str,
     task_type: str,
     task_id: str,
     params: Dict[str, Any],
@@ -223,7 +227,7 @@ def handle_task(
     """Run a single task against the precomputed summary and fire its callback.
 
     Args:
-        document_id: Document id.
+        file_uuid: CSX document uuid; echoed back to the caller as documentId.
         task_type: One of the supported task type strings.
         task_id: Unique id for this task.
         params: Per-task parameters keyed by task type.
@@ -270,14 +274,14 @@ def handle_task(
             logger.error("Unsupported task type: %s", task_type)
             raise ValueError(f"Unsupported task type: {task_type}")
 
-        payload = {"documentId": document_id, "taskId": task_id, "taskType": task_type, **task_result}
-        logger.info("Task %s (%s) for document %s completed", task_id, task_type, document_id)
+        payload = {"documentId": file_uuid, "taskId": task_id, "taskType": task_type, **task_result}
+        logger.info("Task %s (%s) for document %s completed", task_id, task_type, file_uuid)
         logger.debug("Task payload: %s", preview(json.dumps(payload, ensure_ascii=False)))
         send_callback(success_cb, payload)
 
     except Exception as exc:
-        logger.error("Task %s (%s) for document %s failed: %s", task_id, task_type, document_id, exc)
-        payload = {"documentId": document_id, "taskId": task_id, "taskType": task_type, "error": str(exc)}
+        logger.error("Task %s (%s) for document %s failed: %s", task_id, task_type, file_uuid, exc)
+        payload = {"documentId": file_uuid, "taskId": task_id, "taskType": task_type, "error": str(exc)}
         send_callback(error_cb, payload)
 
 
@@ -292,23 +296,41 @@ def health() -> Any:
 
 @app.route("/api/task", methods=["POST"])
 def create_task() -> Any:
-    """Accept a document + task list, return task ids, and process it serially.
+    """Accept a document uuid + task list, return task ids, and process it serially.
 
-    Applies admission control (503 over the pending cap), then queues one
-    ingestion job on the single-worker executor; that job ingests, summarizes,
-    and runs every task inline before the next document begins.
+    The file is pulled from CSX storage by uuid. Object existence is validated
+    synchronously so a bad uuid fails fast; the download itself runs on the
+    ingestion worker so the caller is not held for it. Applies admission control
+    (503 over the pending cap), then queues one ingestion job on the single-worker
+    executor; that job ingests, summarizes, and runs every task inline before the
+    next document begins.
     """
     global _pending_docs
     try:
-        document_id = int(request.form["documentId"])
-        content_type = request.form["documentContentType"]
-        tasks = json.loads(request.form["tasks"])
-        params = json.loads(request.form.get("params", "{}"))
-        success_cb = request.form["successCallbackUrl"]
-        error_cb = request.form["errorCallbackUrl"]
+        # Accept either JSON or form-encoded fields.
+        data = request.get_json(silent=True) or request.form
 
-        if content_type not in CONTENT_TYPES:
-            return jsonify({"error": f"Unsupported Media Type: {content_type}"}), 415
+        def _maybe_json(value: Any, default: Any) -> Any:
+            if value is None:
+                return default
+            return json.loads(value) if isinstance(value, str) else value
+
+        # Round-tripping through uuid.UUID validates the format and normalises
+        # case; it is what makes interpolating this into a Milvus filter safe.
+        file_uuid = str(uuid.UUID(str(data["fileUuid"])))
+        tasks = _maybe_json(data["tasks"], [])
+        params = _maybe_json(data.get("params"), {})
+        success_cb = data["successCallbackUrl"]
+        error_cb = data["errorCallbackUrl"]
+
+        # Existence probe: metadata-only, and lets us 404 before taking a slot.
+        try:
+            if not document_exists(file_uuid):
+                logger.warning("Unknown object %s", file_uuid)
+                return jsonify({"error": f"Unknown file id: {file_uuid}"}), 404
+        except Exception as exc:
+            logger.error("CSX storage unavailable for %s: %s", file_uuid, exc)
+            return jsonify({"error": "Object storage unavailable"}), 502
 
         # Admission control: refuse new work once the pending backlog is full, so
         # a burst applies backpressure to the caller instead of growing our queue
@@ -317,7 +339,7 @@ def create_task() -> Any:
             if _pending_docs >= config.MAX_PENDING_DOCS:
                 logger.warning(
                     "Rejecting document %s: %d pending >= cap %d",
-                    document_id, _pending_docs, config.MAX_PENDING_DOCS,
+                    file_uuid, _pending_docs, config.MAX_PENDING_DOCS,
                 )
                 return (
                     jsonify({"error": "Server busy; too many pending documents",
@@ -328,18 +350,9 @@ def create_task() -> Any:
             _pending_docs += 1
 
         try:
-            # Persist the upload to a temp file for processing.
-            upload = request.files["documentFile"]
-            filename = upload.filename or ""
-            suffix = f'.{content_type.split("/")[-1]}'
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            upload.save(temp_file.name)
-            temp_file.close()
-            temp_file_path = temp_file.name
-
-            # SHA-256 of raw upload bytes (pre-conversion, stable) = content key.
-            with open(temp_file_path, "rb") as fh:
-                content_hash = hashlib.sha256(fh.read()).hexdigest()
+            # Extension is irrelevant: fitz sniffs PDFs by content, and
+            # convert_to_pdf substitutes a correct name for Gotenberg.
+            temp_file_path = os.path.join(tempfile.gettempdir(), f"{file_uuid}.{uuid.uuid4().hex[:8]}.bin")
 
             # Generate task ids up front and return them immediately.
             task_dicts = [{"taskType": task_type, "taskId": generate_task_id()} for task_type in tasks]
@@ -350,15 +363,15 @@ def create_task() -> Any:
                 # document is fully finished before the next one starts.
                 for task_dict in task_dicts:
                     handle_task(
-                        document_id, task_dict["taskType"], task_dict["taskId"],
+                        file_uuid, task_dict["taskType"], task_dict["taskId"],
                         params, success_cb, error_cb, precomputed_summary,
                     )
 
-            def _ingest_and_run(open_doc: Callable[[], Any]) -> None:
+            def _ingest_and_run(open_doc: Callable[[], Any], content_hash: str, filename: str) -> None:
                 # Open once to ingest into Milvus, once more to summarize (the
                 # first context manager closes the document), then run the tasks.
                 with open_doc() as doc:
-                    upload_to_milvus(doc, document_id, encoder_ingest, filename, content_hash)
+                    upload_to_milvus(doc, file_uuid, encoder_ingest, filename, content_hash)
                 with open_doc() as doc:
                     precomputed_summary = summary(doc)
                 _run_tasks_inline(precomputed_summary)
@@ -366,16 +379,29 @@ def create_task() -> Any:
             def background_processing() -> None:
                 global _pending_docs
                 try:
+                    content_type, filename = fetch_document(file_uuid, temp_file_path)
+                    content_type = content_type.split(";")[0].strip().lower()
+                    if content_type not in CONTENT_TYPES:
+                        raise ValueError(f"Unsupported Media Type: {content_type}")
+
+                    # SHA-256 of the raw bytes (pre-conversion, stable) = content key.
+                    digest = hashlib.sha256()
+                    with open(temp_file_path, "rb") as fh:
+                        for block in iter(lambda: fh.read(1 << 20), b""):
+                            digest.update(block)
+                    content_hash = digest.hexdigest()
+
                     if content_type == "application/pdf":
-                        _ingest_and_run(lambda: fitz.open(temp_file_path))
-                    elif content_type in _OFFICE_CONTENT_TYPES:
-                        pdf_bytes = convert_to_pdf(temp_file_path, content_type)
-                        _ingest_and_run(lambda: fitz.open(stream=pdf_bytes, filetype="pdf"))
+                        _ingest_and_run(lambda: fitz.open(temp_file_path), content_hash, filename)
                     else:
-                        raise ValueError(f"Unsupported file type for processing: {content_type}")
+                        pdf_bytes = convert_to_pdf(temp_file_path, content_type)
+                        _ingest_and_run(
+                            lambda: fitz.open(stream=pdf_bytes, filetype="pdf"),
+                            content_hash, filename,
+                        )
                 except Exception as exc:
-                    logger.error("Background processing failed for document %s: %s", document_id, exc)
-                    send_callback(error_cb, {"documentId": document_id, "taskType": "error", "error": str(exc)})
+                    logger.error("Background processing failed for document %s: %s", file_uuid, exc)
+                    send_callback(error_cb, {"documentId": file_uuid, "taskType": "error", "error": str(exc)})
                 finally:
                     logger.debug("Cleaning up temporary file: %s", temp_file_path)
                     try:
@@ -399,6 +425,8 @@ def create_task() -> Any:
         return jsonify({"error": f"Missing required field: {exc}"}), 400
     except json.JSONDecodeError:
         return jsonify({"error": "Invalid JSON in 'tasks' or 'params' field."}), 400
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid field value: {exc}"}), 400
     except Exception as exc:
         logger.error("create_task failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
@@ -409,31 +437,31 @@ def sync_query() -> Any:
     """Synchronous RAG query over ingested documents."""
     try:
         data = request.get_json()
-        document_id = data.get("documentId")
-        document_id = int(document_id) if document_id is not None else None
+        raw_uuid = data.get("fileUuid")
+        file_uuid = str(uuid.UUID(str(raw_uuid))) if raw_uuid else None
         task_type = "OTHER"
         task_id = generate_task_id()
         query = data["query"]
 
         try:
-            is_global = document_id is None
+            is_global = file_uuid is None
             used_full_document = False
             context_fragments: List[Dict[str, Any]] = []
 
-            if document_id is not None:
+            if file_uuid is not None:
                 # Full-document fast path: feed the whole doc if it fits the budget.
-                full_text = fetch_document_text(document_id)
+                full_text = fetch_document_text(file_uuid)
                 doc_budget_chars = config.RAG_CONTEXT_TOKEN_BUDGET * config.CHARS_PER_TOKEN
                 if full_text and len(full_text) <= doc_budget_chars:
-                    context_fragments = [{"file_id": document_id, "contents": full_text}]
+                    context_fragments = [{"file_uuid": file_uuid, "contents": full_text}]
                     used_full_document = True
                     logger.info(
                         "Query for document %s: full-document path (%d chars)",
-                        document_id, len(full_text),
+                        file_uuid, len(full_text),
                     )
 
             if not used_full_document:
-                context_fragments = search_vectors(query, encoder_rag, document_id, reranker=reranker)
+                context_fragments = search_vectors(query, encoder_rag, file_uuid, reranker=reranker)
 
             if not context_fragments:
                 return jsonify({"error": "No context found"}), 404
@@ -454,6 +482,38 @@ def sync_query() -> Any:
 
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
+    
+
+@app.route("/ai/document/<document_id>", methods=["DELETE"])
+def delete_document_route(document_id: str) -> Any:
+    """Remove a document's data from Milvus.
+
+    Idempotent: deleting a uuid that was never ingested is a success, not an
+    error. Chunks are removed only when no other uuid still names that content.
+    """
+    try:
+        file_uuid = str(uuid.UUID(document_id))
+    except ValueError:
+        return jsonify({"error": f"Invalid document id: {document_id}"}), 400
+
+    try:
+        result = delete_document(file_uuid)
+    except Exception as exc:
+        logger.error("Delete failed for document %s: %s", file_uuid, exc)
+        return jsonify({"error": str(exc)}), 500
+
+    if not result["deleted"]:
+        return jsonify({
+            "documentId": file_uuid,
+            "deleted": False,
+            "message": "No such document in the database",
+        }), 200
+
+    return jsonify({
+        "documentId": file_uuid,
+        "deleted": True,
+        "kind": result["kind"],
+    }), 200
 
 
 if __name__ == "__main__":
@@ -466,4 +526,3 @@ if __name__ == "__main__":
     except Exception as exc:
         logger.critical("Server startup or execution failed: %s", exc)
         raise
-    

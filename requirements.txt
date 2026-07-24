@@ -18,7 +18,7 @@ pymilvus==2.6.15              # MUST match your Milvus SERVER major version.
                               # Code targets the 2.x API; do NOT use 3.0.0
                               # unless you have moved to a Milvus 3.x server.
 
-# --- watsonx provider (pin matters: the structured-output / response_format API) ---
+# --- Watsonx provider (pin matters: the structured-output / response_format API) ---
 ibm-watsonx-ai==1.5.13
 
 # --- Structured output (Pydantic v2 API; must not float to v3) ---
@@ -29,5 +29,5 @@ python-dotenv==1.2.2
 
 # Removed: python-docx — not imported anywhere (Gotenberg handles conversion).
 
-# Run the following to uninstall the hf_xet package - reccomended.
+# Run the following to uninstall the hf_xet package - recommended.
 # pip uninstall hf_xet -y

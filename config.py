@@ -216,10 +216,19 @@ COERCION_TIE_EPSILON: float = _get_float("COERCION_TIE_EPSILON", 0.02)
 MILVUS_HOST: str = _get_str("MILVUS_HOST", "localhost")
 MILVUS_PORT: int = _get_int("MILVUS_PORT", 19530)
 MILVUS_COLLECTION: str = _get_str("MILVUS_COLLECTION", "file_embeddings")
-# Multiplier that makes parent_id globally unique across documents:
-#   global_parent_id = file_id * PARENT_ID_MULTIPLIER + local_parent_index
-# Also the hard cap on parent chunks per document (exceeding it would collide).
-PARENT_ID_MULTIPLIER: int = _get_int("PARENT_ID_MULTIPLIER", 100_000)
+
+# --------------------------------------------------------------------------- #
+# CasuSoft X storage (s3-gateway)
+# --------------------------------------------------------------------------- #
+CSX_BASE_URL = os.getenv("CSX_BASE_URL", "http://localhost:8989")
+CSX_USERNAME = os.getenv("CSX_USERNAME", "")
+CSX_PASSWORD = os.getenv("CSX_PASSWORD", "")
+CSX_TENANT = os.getenv("CSX_TENANT") or None   # reader resolves by id; None is correct for us
+CSX_TIMEOUT = float(os.getenv("CSX_TIMEOUT", "30"))
+
+# Hard cap on a fetched document. MAX_CONTENT_LENGTH no longer protects us now
+# that we pull bytes instead of receiving them.
+MAX_DOCUMENT_BYTES = int(os.getenv("MAX_DOCUMENT_BYTES", str(200 * 1024 * 1024)))
 
 # --------------------------------------------------------------------------- #
 # Document conversion (Gotenberg sidecar)

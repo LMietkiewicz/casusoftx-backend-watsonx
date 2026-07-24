@@ -25,7 +25,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
-import config
+import config 
 from logging_utils import preview
 
 if TYPE_CHECKING:  # imported only for type hints; never required at runtime
@@ -44,6 +44,12 @@ TEXT_SEPARATORS: List[str] = ["\n\n", "\n", ". "]
 PARENT_CHUNK_SIZE: int = 1500
 PARENT_CHUNK_OVERLAP: int = 0 #DO NOT CHANGE — needs adjusting for full-text search, which is not implemented yet.
 CHILD_CHUNK_SIZE: int = 400
+
+# Zero-padding width for the local parent index inside parent_id. Padded so a
+# plain lexicographic sort of parent_ids yields reading order. 6 digits keeps the
+# composed id at 71 chars, inside the VARCHAR(72) field.
+_PARENT_INDEX_WIDTH: int = 6
+_PARENT_INDEX_LIMIT: int = 10 ** _PARENT_INDEX_WIDTH
 
 # Polish abbreviations whose trailing period must NOT be treated as a sentence
 # boundary. Extend as needed; for high-accuracy Polish segmentation a dedicated
@@ -389,26 +395,29 @@ def create_table_chunks(
 # --------------------------------------------------------------------------- #
 # Part 5: Global id composition
 # --------------------------------------------------------------------------- #
-def _compose_parent_id(file_id: int, local_index: int) -> int:
-    """Compose a globally unique parent id from a file id and local parent index.
+def _compose_parent_id(content_hash: str, local_index: int) -> str:
+    """Compose a globally unique parent id from a content hash and local index.
+
+    Chunks are owned by content, not by a uuid, so the id is keyed on the hash —
+    a second document with identical bytes reuses these exact rows.
 
     Args:
-        file_id: Unique document id.
+        content_hash: SHA-256 of the source document's bytes.
         local_index: Per-document parent index (0-based).
 
     Returns:
-        ``file_id * PARENT_ID_MULTIPLIER + local_index``.
+        ``f"{content_hash}:{local_index:06d}"``.
 
     Raises:
-        ValueError: If ``local_index`` reaches the multiplier, which would let
-            ids from adjacent documents collide.
+        ValueError: If ``local_index`` reaches the padding limit, past which ids
+            sort out of order ("…:1000000" precedes "…:999999").
     """
-    if local_index >= config.PARENT_ID_MULTIPLIER:
+    if local_index >= _PARENT_INDEX_LIMIT:
         raise ValueError(
-            f"Document {file_id} produced >= {config.PARENT_ID_MULTIPLIER} parent "
-            f"chunks; raise PARENT_ID_MULTIPLIER to preserve global uniqueness."
+            f"Content {content_hash[:12]} produced >= {_PARENT_INDEX_LIMIT} parent "
+            f"chunks; widen _PARENT_INDEX_WIDTH to preserve reading order."
         )
-    return file_id * config.PARENT_ID_MULTIPLIER + local_index
+    return f"{content_hash}:{local_index:0{_PARENT_INDEX_WIDTH}d}"
 
 
 # --------------------------------------------------------------------------- #
@@ -416,20 +425,19 @@ def _compose_parent_id(file_id: int, local_index: int) -> int:
 # --------------------------------------------------------------------------- #
 def processing_pipeline(
     doc: "fitz.Document",
-    file_id: int,
+    content_hash: str,
     model: "SentenceTransformer",
     filename: str = "",
-    content_hash: str = "",
     show_progress: bool = False,
 ) -> List[Dict[str, Any]]:
     """Process a PDF into Milvus-ready parent and child rows.
 
     Args:
         doc: An open PyMuPDF document.
-        file_id: Unique document id (used for global parent-id composition).
+        content_hash: SHA-256 of the source bytes; owns these rows and seeds
+            parent-id composition.
         model: Sentence-transformer encoder for dense child embeddings.
         filename: The name of the file.
-        content_hash: The hash of the file's content.
         show_progress: Whether the encoder shows a progress bar (off in prod).
 
     Returns:
@@ -439,7 +447,7 @@ def processing_pipeline(
     full_text, tables = extract_text_and_tables(doc)
     logger.debug(
         "Document %s: extracted %d chars of text, %d table(s)",
-        file_id, len(full_text), len(tables),
+        content_hash, len(full_text), len(tables),
     )
 
     text_parents = create_text_parent_chunks(
@@ -450,7 +458,7 @@ def processing_pipeline(
 
     logger.debug(
         "Document %s: %d parent chunk(s) -> %d text child(ren), %d table child(ren)",
-        file_id, len(text_parents), len(text_pairs), len(table_pairs),
+        content_hash, len(text_parents), len(text_pairs), len(table_pairs),
     )
     # Full per-chunk dump only when DEBUG is actually enabled, so the preview
     # strings are never built otherwise. This is the "see the processing
@@ -484,24 +492,24 @@ def processing_pipeline(
     parent_placeholder = [0.0] * embedding_dim
 
     rows: List[Dict[str, Any]] = []
-    seen_parents: set[int] = set()
+    seen_parents: set[str] = set()
     child_pairs = text_pairs + table_pairs
 
     # Parent rows (deduplicated by global id).
     for pair in child_pairs:
-        global_id = _compose_parent_id(file_id, pair["parent_id"])
+        global_id = _compose_parent_id(content_hash, pair["parent_id"])
         if global_id in seen_parents:
             continue
         seen_parents.add(global_id)
         rows.append(
             {
-                "file_id": file_id,
+                "file_uuid": "",          
+                "content_hash": content_hash,
                 "parent_id": global_id,
                 "hierarchy": "parent",
                 "type": pair["type"],
                 "contents": pair["parent_contents"],
                 "filename": filename,
-                "content_hash": content_hash,
                 "is_search": True,
                 "dense_embedding": parent_placeholder,
             }
@@ -518,13 +526,13 @@ def processing_pipeline(
     for pair, embedding in zip(child_pairs, embeddings):
         rows.append(
             {
-                "file_id": file_id,
-                "parent_id": _compose_parent_id(file_id, pair["parent_id"]),
+                "file_uuid": "",
+                "content_hash": content_hash,
+                "parent_id": _compose_parent_id(content_hash, pair["parent_id"]),
                 "hierarchy": "child",
                 "type": pair["type"],
                 "contents": pair["child_contents"],
                 "filename": filename,
-                "content_hash": content_hash,
                 "is_search": True,
                 "dense_embedding": embedding.tolist(),
             }
@@ -532,6 +540,6 @@ def processing_pipeline(
 
     logger.info(
         "Document %s: %d parent rows, %d child rows",
-        file_id, len(seen_parents), len(contents_to_embed),
+        content_hash, len(seen_parents), len(contents_to_embed),
     )
     return rows

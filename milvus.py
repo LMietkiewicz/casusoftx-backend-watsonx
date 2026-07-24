@@ -100,17 +100,21 @@ def _build_schema(embedding_dim: int) -> "MilvusClient.create_schema":
 
     Fields:
         id:               auto-generated INT64 primary key.
-        file_id:          INT64 identifier of the source document.
-        parent_id:        INT64 globally-unique parent id, composed at ingest as
-                          file_id * PARENT_ID_MULTIPLIER + local index, so
-                          retrieval fetches parents with a flat `parent_id in [...]`.
-        hierarchy:        'parent' or 'child'.
+        file_uuid:        CSX object uuid. Set on POINTER rows only; empty on
+                          chunk rows, which are owned by content, not by a uuid.
+        content_hash:     SHA-256 of the source bytes. The ownership key: pointer
+                          rows name it, chunk rows carry it.
+        parent_id:        globally-unique parent id, composed at ingest as
+                          f"{content_hash}:{index:06d}", so retrieval fetches
+                          parents with a flat `parent_id in [...]` and reading
+                          order is plain lexicographic sort.
+        hierarchy:        'parent' or 'child' ('parent' on pointer rows, unused).
         type:             'text' or 'table'.
         filename:         the source file name (for display).
-        content_hash:     the source file's content hash (for deduplication).
-        is_search:        whether to include this row in search results.
+        is_search:        True on chunk rows, False on pointer rows. Every query
+                          pins to True so pointer rows never surface.
         contents:         the chunk text; analyzer-enabled to feed BM25.
-        dense_embedding:  semantic vector (zero placeholder for parent rows).
+        dense_embedding:  semantic vector (zero placeholder on pointer rows).
         sparse_embedding: BM25 vector produced from `contents` by the function.
 
     Returns:
@@ -132,12 +136,13 @@ def _build_schema(embedding_dim: int) -> "MilvusClient.create_schema":
         is_primary=True,
         auto_id=True,
     )
-    schema.add_field(field_name="file_id", datatype=DataType.INT64)
-    schema.add_field(field_name="parent_id", datatype=DataType.INT64)
+    schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True)
+    schema.add_field(field_name="file_uuid", datatype=DataType.VARCHAR, max_length=36)
+    schema.add_field(field_name="content_hash", datatype=DataType.VARCHAR, max_length=64)
+    schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=72)
     schema.add_field(field_name="hierarchy", datatype=DataType.VARCHAR, max_length=16)
     schema.add_field(field_name="type", datatype=DataType.VARCHAR, max_length=16)
     schema.add_field(field_name="filename", datatype=DataType.VARCHAR, max_length=512)
-    schema.add_field(field_name="content_hash", datatype=DataType.VARCHAR, max_length=64)
     schema.add_field(field_name="is_search", datatype=DataType.BOOL)
     schema.add_field(
         field_name="contents",
@@ -196,8 +201,9 @@ def _build_index_params() -> "MilvusClient.prepare_index_params":
     )
 
     # Scalar indexes for hot-path filter fields (else linear scans).
-    index_params.add_index(field_name="file_id", index_type="INVERTED")
+    index_params.add_index(field_name="file_uuid", index_type="INVERTED")
     index_params.add_index(field_name="content_hash", index_type="INVERTED")
+    index_params.add_index(field_name="parent_id", index_type="INVERTED")
     index_params.add_index(field_name="is_search", index_type="INVERTED")
 
     return index_params
@@ -308,4 +314,3 @@ def _main() -> None:
 
 if __name__ == "__main__":
     _main()
-    

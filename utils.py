@@ -21,6 +21,7 @@ import config
 from logging_utils import preview
 from milvus import get_milvus_client, reset_client
 from processing import processing_pipeline
+from s3gateway_client import S3GatewayError, get_csx_storage_client
 
 if TYPE_CHECKING:  # type-only; these objects are passed in, never imported at runtime
     import fitz
@@ -255,35 +256,31 @@ def strip_markdown(text: str) -> str:
 # --------------------------------------------------------------------------- #
 # Query-side helpers: dedup alias resolution & full-document reassembly
 # --------------------------------------------------------------------------- #
-def resolve_document_scope(file_id: int) -> Optional[str]:
-    """Filter scoping a query to one document's real chunks, following the alias.
+def resolve_document_scope(file_uuid: str) -> Optional[str]:
+    """Filter scoping a query to the chunks of whatever content this uuid names.
 
-    Real document -> ``file_id == F``; dummy alias -> the canonical doc sharing
-    its content_hash. None if the id is unknown.
+    Every uuid is a pointer row carrying a content_hash; the chunks belong to the
+    content. None if the uuid is unknown.
     """
     client = get_milvus_client()
     rows = client.query(
         collection_name=config.MILVUS_COLLECTION,
-        filter=f"file_id == {int(file_id)}",
-        output_fields=["is_search", "content_hash"],
+        filter=f'file_uuid == "{file_uuid}"',
+        output_fields=["content_hash"],
         limit=1,
     )
     if not rows:
         return None
-    row = rows[0]
-    if row.get("is_search"):
-        return f"file_id == {int(file_id)}"
-    content_hash = row.get("content_hash", "")
-    return f'content_hash == "{content_hash}" and is_search == true'
+    return f'content_hash == "{rows[0]["content_hash"]}" and is_search == true'
 
 
-def fetch_document_text(file_id: int) -> str:
+def fetch_document_text(file_uuid: str) -> str:
     """Reassemble a document's full text from its text parents, in reading order.
 
     Text parents tile the document and parent_id encodes order; table parents are
     excluded (their cell text is already inline). Follows the dedup alias.
     """
-    scope = resolve_document_scope(file_id)
+    scope = resolve_document_scope(file_uuid)
     if scope is None:
         return ""
     client = get_milvus_client()
@@ -326,7 +323,7 @@ def _milvus_read(operation: Callable[[MilvusClient], Any]) -> Any:
 def search_vectors(
     query_text: str,
     encoder: "SentenceTransformer",
-    document_id: Optional[int] = None,
+    file_uuid: Optional[str] = None,
     top_k: int = 10,
     reranker: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
@@ -336,7 +333,6 @@ def search_vectors(
     to canonical (is_search) chunks. With a reranker, a wide candidate pool is
     pulled and re-scored, keeping RERANK_TOP_K.
     """
-    document_id = int(document_id) if document_id is not None else None
     use_rerank = config.RERANK_ENABLED and reranker is not None
     candidate_k = config.RERANK_CANDIDATES if use_rerank else top_k
 
@@ -344,10 +340,10 @@ def search_vectors(
     with _rag_encode_lock:
         query_embedding = encoder.encode(config.QUERY_PREFIX + query_text).tolist()
 
-    if document_id is not None:
-        scope = resolve_document_scope(document_id)
+    if file_uuid is not None:
+        scope = resolve_document_scope(file_uuid)
         if scope is None:
-            logger.debug("search: document %s unknown; no results", document_id)
+            logger.debug("search: document %s unknown; no results", file_uuid)
             return []
         child_filter = f"hierarchy == 'child' and ({scope})"
     else:
@@ -384,13 +380,14 @@ def search_vectors(
         }
         if not parent_ids:
             return []
+        quoted_ids = ", ".join(f'"{pid}"' for pid in parent_ids)
         parent_filter = (
-            f"parent_id in {list(parent_ids)} and hierarchy == 'parent' and is_search == true"
+            f"parent_id in [{quoted_ids}] and hierarchy == 'parent' and is_search == true"
         )
         return client.query(
             collection_name=config.MILVUS_COLLECTION,
             filter=parent_filter,
-            output_fields=["parent_id", "contents", "file_id", "type", "filename"],
+            output_fields=["parent_id", "contents", "content_hash", "type", "filename"],
             consistency_level="Strong",
         )
 
@@ -404,91 +401,153 @@ def search_vectors(
 
     logger.debug(
         "search %s (doc=%s, rerank=%s) -> %d parent fragment(s)",
-        preview(query_text, 120), document_id, use_rerank, len(parents),
+        preview(query_text, 120), file_uuid, use_rerank, len(parents),
     )
     return parents
 
 
 def upload_to_milvus(
     doc: "fitz.Document",
-    file_id: int,
+    file_uuid: str,
     model: "SentenceTransformer",
     filename: str = "",
     content_hash: str = "",
 ) -> None:
-    """Ingest a document into Milvus, with deduplication.
+    """Ingest a document into Milvus and name it with a pointer row.
 
-    1. Same file_id present -> skip. 2. Same content_hash under another id ->
-    write one dummy alias row (is_search=False). 3. New content -> full ingest.
+    1. uuid already known -> nothing to do.
+    2. content already ingested -> skip chunking, write the pointer only.
+    3. new content -> full ingest, then the pointer.
+
+    The pointer is written LAST on purpose: a crash before it leaves unnamed
+    chunks, which the next ingest of the same content picks up and names. The
+    reverse order would leave a pointer aimed at nothing, permanently.
     """
-    file_id = int(file_id)
+    if not content_hash:
+        raise ValueError("content_hash is required; it is the ownership key")
     try:
         client = get_milvus_client()
 
         if not client.has_collection(config.MILVUS_COLLECTION):
             logger.error(
                 "Collection '%s' does not exist; cannot upload file %s",
-                config.MILVUS_COLLECTION, file_id,
+                config.MILVUS_COLLECTION, file_uuid,
             )
             return
 
-        existing_id = client.query(
+        known = client.query(
             collection_name=config.MILVUS_COLLECTION,
-            filter=f"file_id == {file_id}",
-            output_fields=["file_id"],
+            filter=f'file_uuid == "{file_uuid}"',
+            output_fields=["file_uuid"],
             limit=1,
         )
-        if existing_id:
-            logger.info("File %s already present in collection; skipping upload", file_id)
+        if known:
+            logger.info("File %s already present in collection; skipping upload", file_uuid)
             return
 
-        if content_hash:
-            existing_hash = client.query(
-                collection_name=config.MILVUS_COLLECTION,
-                filter=f'content_hash == "{content_hash}" and is_search == true',
-                output_fields=["file_id"],
-                limit=1,
+        content_present = client.query(
+            collection_name=config.MILVUS_COLLECTION,
+            filter=f'content_hash == "{content_hash}" and is_search == true',
+            output_fields=["content_hash"],
+            limit=1,
+        )
+        if content_present:
+            logger.info(
+                "Content of file %s already ingested (hash match); writing pointer only",
+                file_uuid,
             )
-            if existing_hash:
-                canonical = existing_hash[0].get("file_id")
-                logger.info(
-                    "Content of file %s already present (hash match, canonical=%s); "
-                    "writing dummy alias row instead of re-ingesting",
-                    file_id, canonical,
-                )
-                embedding_dim = model.get_sentence_embedding_dimension()
-                client.insert(
-                    collection_name=config.MILVUS_COLLECTION,
-                    data=[_dummy_alias_row(file_id, filename, content_hash, embedding_dim)],
-                )
+        else:
+            logger.info("Processing file %s for upload", file_uuid)
+            rows = processing_pipeline(doc, content_hash, model, filename=filename)
+            if not rows:
+                logger.warning("Processing produced no rows for file %s; nothing to upload", file_uuid)
                 return
+            result = client.insert(collection_name=config.MILVUS_COLLECTION, data=rows)
+            logger.info("Inserted %s record(s) for file %s", result["insert_count"], file_uuid)
 
-        logger.info("Processing file %s for upload", file_id)
-        rows = processing_pipeline(doc, file_id, model, filename=filename, content_hash=content_hash)
+        client.insert(
+            collection_name=config.MILVUS_COLLECTION,
+            data=[_pointer_row(file_uuid, filename, content_hash,
+                               model.get_sentence_embedding_dimension())],
+        )
+
+    except Exception:
+        reset_client()
+        raise
+    
+
+def delete_document(file_uuid: str) -> Dict[str, Any]:
+    """Remove a uuid from Milvus. Idempotent.
+
+    Deletes the uuid's pointer row. The chunks go only when no other uuid still
+    names that content, so deleting one copy never breaks its duplicates.
+
+    Returns:
+        ``{"deleted": bool, "kind": str}`` where kind is one of
+        ``not_found`` | ``pointer_removed`` | ``content_removed``.
+    """
+    try:
+        client = get_milvus_client()
+
+        rows = client.query(
+            collection_name=config.MILVUS_COLLECTION,
+            filter=f'file_uuid == "{file_uuid}"',
+            output_fields=["content_hash"],
+            limit=1,
+        )
         if not rows:
-            logger.warning("Processing produced no rows for file %s; nothing to upload", file_id)
-            return
+            logger.info("Delete requested for unknown document %s; nothing to do", file_uuid)
+            return {"deleted": False, "kind": "not_found"}
 
-        result = client.insert(collection_name=config.MILVUS_COLLECTION, data=rows)
-        logger.info("Inserted %s record(s) for file %s", result["insert_count"], file_id)
+        content_hash = rows[0]["content_hash"]
+
+        # Look for other names BEFORE deleting, so this does not depend on the
+        # delete being visible to the following query.
+        others = client.query(
+            collection_name=config.MILVUS_COLLECTION,
+            filter=(f'content_hash == "{content_hash}" and is_search == false '
+                    f'and file_uuid != "{file_uuid}"'),
+            output_fields=["file_uuid"],
+            limit=1,
+        )
+
+        client.delete(
+            collection_name=config.MILVUS_COLLECTION,
+            filter=f'file_uuid == "{file_uuid}"',
+        )
+
+        if others:
+            logger.info(
+                "Deleted pointer %s; content still named by other uuid(s)", file_uuid
+            )
+            return {"deleted": True, "kind": "pointer_removed"}
+
+        client.delete(
+            collection_name=config.MILVUS_COLLECTION,
+            filter=f'content_hash == "{content_hash}" and is_search == true',
+        )
+        logger.info("Deleted %s and its content (last reference)", file_uuid)
+        return {"deleted": True, "kind": "content_removed"}
 
     except Exception:
         reset_client()
         raise
 
 
-def _dummy_alias_row(file_id: int, filename: str, content_hash: str, embedding_dim: int) -> Dict[str, Any]:
-    """Non-searchable alias row for a content-duplicate document (resolves to the
-    canonical copy via content_hash). is_search=False excludes it from all queries.
+def _pointer_row(file_uuid: str, filename: str, content_hash: str, embedding_dim: int) -> Dict[str, Any]:
+    """Non-searchable row naming a uuid and binding it to a content hash.
+
+    is_search=False excludes it from every query; resolve_document_scope reads
+    its content_hash to find the chunks.
     """
     return {
-        "file_id": file_id,
-        "parent_id": file_id,  # arbitrary; never queried
+        "file_uuid": file_uuid,
+        "content_hash": content_hash,
+        "parent_id": file_uuid,  
         "hierarchy": "parent",
         "type": "text",
-        "contents": "x",       # BM25 needs a token; never searched
+        "contents": "x",        
         "filename": filename,
-        "content_hash": content_hash,
         "is_search": False,
         "dense_embedding": [0.0] * embedding_dim,
     }
@@ -558,3 +617,68 @@ def convert_to_pdf(file_path: str, content_type: str) -> bytes:
 
     logger.debug("Gotenberg returned %d bytes of PDF", len(response.content))
     return response.content
+
+# --------------------------------------------------------------------------- #
+# CSX storage retrieval
+# --------------------------------------------------------------------------- #
+def document_exists(file_uuid: str) -> bool:
+    """Check that an object is present in CSX storage.
+
+    Args:
+        file_uuid: The gateway's file id.
+
+    Returns:
+        True if present, False on 404.
+
+    Raises:
+        S3GatewayError: On any non-404 gateway failure.
+        requests.exceptions.RequestException: If the gateway is unreachable.
+    """
+    try:
+        get_csx_storage_client().get_metadata(file_uuid)
+        return True
+    except S3GatewayError as exc:
+        if exc.status == 404:
+            return False
+        raise
+
+
+def fetch_document(file_uuid: str, dest_path: str) -> tuple[str, str]:
+    """Stream an object from CSX storage to a local path.
+
+    Streamed rather than buffered, with a running size guard, so an oversized
+    document is refused before it is fully written to disk.
+
+    Args:
+        file_uuid: The gateway's file id.
+        dest_path: Local path to write to.
+
+    Returns:
+        (content_type, filename) as reported by the gateway.
+
+    Raises:
+        ValueError: If the object exceeds MAX_DOCUMENT_BYTES.
+        S3GatewayError: On gateway failure.
+    """
+    headers, chunks = get_csx_storage_client().download_stream(file_uuid)
+
+    # Content-Length is -1 when the gateway omits the header; the running
+    # check below covers that case.
+    if 0 <= config.MAX_DOCUMENT_BYTES < headers.content_length:
+        chunks.close()
+        raise ValueError(
+            f"Document {file_uuid} is {headers.content_length} bytes, "
+            f"over the {config.MAX_DOCUMENT_BYTES} limit"
+        )
+
+    written = 0
+    with open(dest_path, "wb") as sink:
+        for chunk in chunks:
+            written += len(chunk)
+            if written > config.MAX_DOCUMENT_BYTES:
+                chunks.close()
+                raise ValueError(f"Document {file_uuid} exceeded the size limit mid-stream")
+            sink.write(chunk)
+
+    logger.debug("Fetched %s (%d bytes, %s)", file_uuid, written, headers.content_type)
+    return headers.content_type, headers.filename or file_uuid
