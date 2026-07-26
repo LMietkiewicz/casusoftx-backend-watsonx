@@ -15,9 +15,16 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from cipher import resolve
+
 # Load variables from a local .env file if one exists. Real environment
 # variables always take precedence over .env entries.
 load_dotenv()
+
+# Passphrase for decrypting ENC(...) config values. Unset is fine as long as no
+# ENC(...) values are present; resolve() raises a clear error if one appears
+# without it. Read from the raw env, never itself encrypted.
+_CONFIG_PASSPHRASE: Optional[str] = os.getenv("CONFIG_PASSPHRASE")
 
 
 class ConfigError(RuntimeError):
@@ -101,6 +108,12 @@ def _get_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a float, got {raw!r}") from exc
+    
+    
+def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Read a possibly-encrypted secret, stripping whitespace, then decrypting
+    an ENC(...) envelope if present. Plain values pass through untouched."""
+    return resolve(_get_str(name, default), _CONFIG_PASSPHRASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +126,7 @@ _VALID_PROVIDERS = {"ollama", "watsonx"}
 # present, assume watsonx so existing .env files keep working. An explicit
 # PROVIDER value always wins.
 _explicit_provider = _get_str("PROVIDER")
-_legacy_api_key = _get_str("API_KEY", "")
+_legacy_api_key = _get_secret("API_KEY", "")
 PROVIDER: str = (
     _explicit_provider.lower()
     if _explicit_provider
@@ -124,7 +137,7 @@ PROVIDER: str = (
 # Inference provider & model configuration
 # --------------------------------------------------------------------------- #
 API_KEY: str = _legacy_api_key
-PROJECT_ID: str = _get_str("PROJECT_ID", "")
+PROJECT_ID: str = _get_secret("PROJECT_ID", "")
 
 # --- Model selection (gated) ---
 # Default models are pinned in code per provider and are deliberately NOT read
