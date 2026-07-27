@@ -130,12 +130,6 @@ def _build_schema(embedding_dim: int) -> "MilvusClient.create_schema":
 
     schema = MilvusClient.create_schema()
 
-    schema.add_field(
-        field_name="id",
-        datatype=DataType.INT64,
-        is_primary=True,
-        auto_id=True,
-    )
     schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True)
     schema.add_field(field_name="file_uuid", datatype=DataType.VARCHAR, max_length=36)
     schema.add_field(field_name="content_hash", datatype=DataType.VARCHAR, max_length=64)
@@ -144,6 +138,7 @@ def _build_schema(embedding_dim: int) -> "MilvusClient.create_schema":
     schema.add_field(field_name="type", datatype=DataType.VARCHAR, max_length=16)
     schema.add_field(field_name="filename", datatype=DataType.VARCHAR, max_length=512)
     schema.add_field(field_name="is_search", datatype=DataType.BOOL)
+
     schema.add_field(
         field_name="contents",
         datatype=DataType.VARCHAR,
