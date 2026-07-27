@@ -42,3 +42,6 @@ Thumbs.db
 *.md
 !README.md
 .github/
+opnshft.yaml
+Dockerfile
+!openshift.Dockerfile
