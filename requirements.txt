@@ -24,6 +24,9 @@ ibm-watsonx-ai==1.5.13
 # --- Structured output (Pydantic v2 API; must not float to v3) ---
 pydantic==2.13.4
 
+# --- Cryptography ---
+cryptography==49.0.0
+
 # --- Configuration ---
 python-dotenv==1.2.2
 
