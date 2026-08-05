@@ -18,7 +18,7 @@ metadata:
 data:
   # --- inference backend ---
   PROVIDER: "watsonx"                              # ollama | watsonx
-  INFERENCE_PROVIDER_BASE_URL: "CHANGE_ME"        # watsonx endpoint, e.g.
+  INFERENCE_PROVIDER_BASE_URL: "https://eu-de.ml.cloud.ibm.com"        # watsonx endpoint, e.g.
                                                   # https://us-south.ml.cloud.ibm.com
                                                   # (ollama: a URL reachable from the
                                                   # pod — localhost:11434 does NOT
@@ -26,8 +26,8 @@ data:
 
   # --- watsonx credentials (ENCRYPTED) ---
   # Generate each with:  CONFIG_PASSPHRASE=... python cipher.py encrypt
-  API_KEY: "ENC(CHANGE_ME)"
-  PROJECT_ID: "ENC(CHANGE_ME)"
+  API_KEY: "ENC(B7mYazS1tfvMBNlaWISMw5zEjARoEqXx0bF/VZeYK5ovgoL20Io5QkDuKC60MciMNU9xod3S5Eefir4xBedSAbXpHz9LbJPnRiUKEPP15xDjkKnM9L0qFQ==)"
+  PROJECT_ID: "ENC(x/mBBXfbowN5pP/BLFDGGli7XtGZbNZosc2ihsfPQjabEBnpgi0Zy6m7qcY2cnEuV+/eKTVpN2/gKLqJxITBGlIHYRkJFQhMIEuQQRIDZDg=)"
 
   # --- CasuSoft X storage (s3-gateway) ---
   CSX_BASE_URL: "CHANGE_ME"                        
@@ -58,7 +58,7 @@ metadata:
   name: casusoftx-backend-secrets
 type: Opaque
 stringData:
-  CONFIG_PASSPHRASE: "CHANGE_ME"
+  CONFIG_PASSPHRASE: "23gf2hvf273yfvjhvyifg23fyr4fiyfncnn33y3"
 
 ---
 apiVersion: apps/v1
