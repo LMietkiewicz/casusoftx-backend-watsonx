@@ -27,7 +27,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List
 
-import fitz  # PyMuPDF
+import io
+import pdfplumber
 import hashlib
 import requests
 from flask import Flask, jsonify, request
@@ -350,8 +351,8 @@ def create_task() -> Any:
             _pending_docs += 1
 
         try:
-            # Extension is irrelevant: fitz sniffs PDFs by content, and
-            # convert_to_pdf substitutes a correct name for Gotenberg.
+            # Extension is irrelevant: routing is by Content-Type, and
+            # convert_to_pdf substitutes a correct name for the converter.
             temp_file_path = os.path.join(tempfile.gettempdir(), f"{file_uuid}.{uuid.uuid4().hex[:8]}.bin")
 
             # Generate task ids up front and return them immediately.
@@ -392,12 +393,12 @@ def create_task() -> Any:
                     content_hash = digest.hexdigest()
 
                     if content_type == "application/pdf":
-                        _ingest_and_run(lambda: fitz.open(temp_file_path), content_hash, filename)
+                        _ingest_and_run(lambda: pdfplumber.open(temp_file_path), content_hash, filename)
                     else:
                         pdf_bytes = convert_to_pdf(temp_file_path, content_type)
                         _ingest_and_run(
-                            lambda: fitz.open(stream=pdf_bytes, filetype="pdf"),
-                            content_hash, filename,
+                            lambda: pdfplumber.open(io.BytesIO(pdf_bytes)),
+                            content_hash, filename
                         )
                 except Exception as exc:
                     logger.error("Background processing failed for document %s: %s", file_uuid, exc)

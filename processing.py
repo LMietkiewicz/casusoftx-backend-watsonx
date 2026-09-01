@@ -14,8 +14,8 @@ Sizing lives in two independent regimes (see also config.py): the LLM
 summarization budget is unrelated to the *encoder* sequence limit that bounds
 child-chunk size here.
 
-This module imports neither PyMuPDF nor sentence-transformers at runtime — the
-``fitz.Document`` and ``SentenceTransformer`` objects are passed in and used via
+This module imports neither pdfplumber nor sentence-transformers at runtime — the
+``pdfplumber.PDF`` and ``SentenceTransformer`` objects are passed in and used via
 duck typing; they appear only as type-checking-time annotations.
 """
 from __future__ import annotations
