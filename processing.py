@@ -29,7 +29,7 @@ import config
 from logging_utils import preview
 
 if TYPE_CHECKING:  # imported only for type hints; never required at runtime
-    import fitz
+    import pdfplumber
     from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ _ABBREVIATIONS = {
 # --------------------------------------------------------------------------- #
 # Part 1: Extraction
 # --------------------------------------------------------------------------- #
-def extract_text_and_tables(doc: "fitz.Document") -> Tuple[str, List[Dict[str, Any]]]:
+def extract_text_and_tables(doc: "pdfplumber.PDF") -> Tuple[str, List[Dict[str, Any]]]:
     """Extract concatenated text and structured tables from a PDF.
 
     Note: ``get_text`` already includes table cell text, so table content also
@@ -72,7 +72,7 @@ def extract_text_and_tables(doc: "fitz.Document") -> Tuple[str, List[Dict[str, A
     for dedicated row-level chunking.
 
     Args:
-        doc: An open PyMuPDF document.
+        doc: An open pdfplumber document.
 
     Returns:
         A tuple of (all page text joined by blank lines, list of table dicts
@@ -424,7 +424,7 @@ def _compose_parent_id(content_hash: str, local_index: int) -> str:
 # Part 6: Full ingest pipeline
 # --------------------------------------------------------------------------- #
 def processing_pipeline(
-    doc: "fitz.Document",
+    doc: "pdfplumber.PDF",
     content_hash: str,
     model: "SentenceTransformer",
     filename: str = "",
@@ -433,7 +433,7 @@ def processing_pipeline(
     """Process a PDF into Milvus-ready parent and child rows.
 
     Args:
-        doc: An open PyMuPDF document.
+        doc: An open pdfplumber document.
         content_hash: SHA-256 of the source bytes; owns these rows and seeds
             parent-id composition.
         model: Sentence-transformer encoder for dense child embeddings.
