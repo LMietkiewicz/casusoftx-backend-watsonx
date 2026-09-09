@@ -1,33 +1,33 @@
-"""utils.py - LLM inference, Milvus hybrid search, and document-to-PDF conversion.
+"""utils.py - LLM inference, Postgres hybrid search, and document-to-PDF conversion.
 
 These are the integration points to external systems: the inference backend
-(Ollama or IBM watsonx), the Milvus vector store, and the Gotenberg conversion
-service. Heavy/optional dependencies (watsonx SDK) are imported lazily so a
-deployment only needs the libraries for the provider it actually uses.
+(Ollama or IBM watsonx), the Postgres/pgvector store, and the unoserver sidecar
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
+import socket
 import threading
+
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import requests
-from pymilvus import AnnSearchRequest, MilvusClient, RRFRanker
+import psycopg
 
 import config
 from logging_utils import preview
-from milvus import get_milvus_client, reset_client
+from pgstore import get_pool, reset_pool
 from processing import processing_pipeline
 from s3gateway_client import S3GatewayError, get_csx_storage_client
 
 if TYPE_CHECKING:  # type-only; these objects are passed in, never imported at runtime
-    import fitz
+    from pdf_io import PdfBundle
     from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+
 
 # Serializes forward passes through the shared RAG query encoder and reranker, which 
 # several request threads may hit at once. Document-ingestion embedding uses a separate
@@ -36,6 +36,57 @@ _rag_encode_lock = threading.Lock()
 
 # Serializes the shared cross-encoder reranker across concurrent query threads.
 _rerank_lock = threading.Lock()
+
+# Each leg ranks CHILD chunks, then collapses to parents with MIN(rn)
+_HYBRID_SEARCH_SQL = """
+WITH dense AS (
+    SELECT parent_id, MIN(rn) AS rank FROM (
+        SELECT parent_id,
+               ROW_NUMBER() OVER (ORDER BY dense_embedding <#> %(qvec)s) AS rn
+        FROM {table}
+        WHERE hierarchy = 'child' AND is_search
+          AND (%(scope)s::text IS NULL OR content_hash = %(scope)s::text)
+        ORDER BY dense_embedding <#> %(qvec)s
+        LIMIT %(wide)s
+    ) d GROUP BY parent_id
+),
+sparse AS (
+    SELECT parent_id, MIN(rn) AS rank FROM (
+        SELECT parent_id,
+               ROW_NUMBER() OVER (
+                   ORDER BY ts_rank_cd(contents_tsv,
+                                       plainto_tsquery('simple', %(qtext)s)) DESC
+               ) AS rn
+        FROM {table}
+        WHERE hierarchy = 'child' AND is_search
+          AND (%(scope)s::text IS NULL OR content_hash = %(scope)s::text)
+          AND contents_tsv @@ plainto_tsquery('simple', %(qtext)s)
+        ORDER BY ts_rank_cd(contents_tsv,
+                            plainto_tsquery('simple', %(qtext)s)) DESC
+        LIMIT %(wide)s
+    ) s GROUP BY parent_id
+),
+fused AS (
+    SELECT COALESCE(d.parent_id, s.parent_id) AS parent_id,
+           COALESCE(1.0 / (60 + d.rank), 0) + COALESCE(1.0 / (60 + s.rank), 0) AS score
+    FROM dense d FULL OUTER JOIN sparse s USING (parent_id)
+    ORDER BY score DESC
+    LIMIT %(cand)s
+)
+SELECT c.parent_id, c.contents, c.content_hash, c.type, c.filename
+FROM {table} c JOIN fused f USING (parent_id)
+WHERE c.hierarchy = 'parent' AND c.is_search
+ORDER BY f.score DESC
+"""
+
+# Column order is fixed here so processing_pipeline's row dicts insert directly.
+_INSERT_SQL = """
+INSERT INTO {table}
+    (file_uuid, content_hash, parent_id, hierarchy, type, filename,
+     is_search, contents, dense_embedding)
+VALUES (%(file_uuid)s, %(content_hash)s, %(parent_id)s, %(hierarchy)s, %(type)s,
+        %(filename)s, %(is_search)s, %(contents)s, %(dense_embedding)s)
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -257,21 +308,20 @@ def strip_markdown(text: str) -> str:
 # Query-side helpers: dedup alias resolution & full-document reassembly
 # --------------------------------------------------------------------------- #
 def resolve_document_scope(file_uuid: str) -> Optional[str]:
-    """Filter scoping a query to the chunks of whatever content this uuid names.
+    """The content_hash of whatever content this uuid names, or None if unknown.
 
     Every uuid is a pointer row carrying a content_hash; the chunks belong to the
-    content. None if the uuid is unknown.
+    content. Returns the hash itself rather than a filter fragment — callers
+    bind it as a query parameter, so it is never interpolated into SQL.
     """
-    client = get_milvus_client()
-    rows = client.query(
-        collection_name=config.MILVUS_COLLECTION,
-        filter=f'file_uuid == "{file_uuid}"',
-        output_fields=["content_hash"],
-        limit=1,
-    )
-    if not rows:
-        return None
-    return f'content_hash == "{rows[0]["content_hash"]}" and is_search == true'
+    with get_pool().connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            f"SELECT content_hash FROM {config.POSTGRES_TABLE} "
+            f"WHERE file_uuid = %s LIMIT 1",
+            (file_uuid,),
+        )
+        row = cursor.fetchone()
+    return row[0] if row else None
 
 
 def fetch_document_text(file_uuid: str) -> str:
@@ -280,44 +330,44 @@ def fetch_document_text(file_uuid: str) -> str:
     Text parents tile the document and parent_id encodes order; table parents are
     excluded (their cell text is already inline). Follows the dedup alias.
     """
-    scope = resolve_document_scope(file_uuid)
-    if scope is None:
+    content_hash = resolve_document_scope(file_uuid)
+    if content_hash is None:
         return ""
-    client = get_milvus_client()
-    rows = client.query(
-        collection_name=config.MILVUS_COLLECTION,
-        filter=f'({scope}) and hierarchy == "parent" and type == "text"',
-        output_fields=["parent_id", "contents"],
-        limit=16384,
-    )
-    if not rows:
-        return ""
-    rows.sort(key=lambda r: r["parent_id"])
-    return "\n".join(r["contents"] for r in rows)
+    with get_pool().connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            f"SELECT contents FROM {config.POSTGRES_TABLE} "
+            f"WHERE content_hash = %s AND is_search "
+            f"  AND hierarchy = 'parent' AND type = 'text' "
+            f"ORDER BY parent_id",
+            (content_hash,),
+        )
+        rows = cursor.fetchall()
+    return "\n".join(row[0] for row in rows)
 
 
 # --------------------------------------------------------------------------- #
-# Milvus hybrid search
+# Postgres hybrid search & storage
 # --------------------------------------------------------------------------- #
-def _milvus_read(operation: Callable[[MilvusClient], Any]) -> Any:
-    """Run a read-only Milvus operation, reconnecting once on failure.
+def _pg_read(operation: Callable[[Any], Any]) -> Any:
+    """Run a read-only Postgres operation, reconnecting once on failure.
 
-    Reads are idempotent, so a single retry after rebuilding the client safely
-    absorbs the transient connection drops that previously motivated rebuilding
-    the client on every call.
+    Reads are idempotent, so a single retry after rebuilding the pool safely
+    absorbs transient connection drops.
 
     Args:
-        operation: Callable receiving the client and returning a result.
+        operation: Callable receiving a connection and returning a result.
 
     Returns:
         The operation's result.
     """
     try:
-        return operation(get_milvus_client())
+        with get_pool().connection() as connection:
+            return operation(connection)
     except Exception as exc:
-        logger.warning("Milvus read failed (%s); reconnecting and retrying once.", exc)
-        reset_client()
-        return operation(get_milvus_client())
+        logger.warning("Postgres read failed (%s); reconnecting and retrying once.", exc)
+        reset_pool()
+        with get_pool().connection() as connection:
+            return operation(connection)
 
 
 def search_vectors(
@@ -327,7 +377,7 @@ def search_vectors(
     top_k: int = 10,
     reranker: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    """Hybrid (dense + BM25) search over children, returning reranked parents.
+    """Hybrid (dense + full-text) search over children, returning reranked parents.
 
     Single-document searches follow the dedup alias; global searches are pinned
     to canonical (is_search) chunks. With a reranker, a wide candidate pool is
@@ -336,62 +386,38 @@ def search_vectors(
     use_rerank = config.RERANK_ENABLED and reranker is not None
     candidate_k = config.RERANK_CANDIDATES if use_rerank else top_k
 
-    # mmlw-retrieval: dense query needs the query prefix; BM25 gets raw text.
+    # mmlw-retrieval: dense query needs the query prefix; the full-text leg
+    # gets raw text.
     with _rag_encode_lock:
         query_embedding = encoder.encode(config.QUERY_PREFIX + query_text).tolist()
 
     if file_uuid is not None:
-        scope = resolve_document_scope(file_uuid)
-        if scope is None:
+        content_hash = resolve_document_scope(file_uuid)
+        if content_hash is None:
             logger.debug("search: document %s unknown; no results", file_uuid)
             return []
-        child_filter = f"hierarchy == 'child' and ({scope})"
     else:
-        child_filter = "hierarchy == 'child' and is_search == true"
+        content_hash = None
 
-    def _search(client: MilvusClient) -> List[Dict[str, Any]]:
-        dense_req = AnnSearchRequest(
-            data=[query_embedding],
-            anns_field="dense_embedding",
-            param={"metric_type": "IP"},
-            limit=candidate_k * 2,
-            expr=child_filter,
-        )
-        sparse_req = AnnSearchRequest(
-            data=[query_text],
-            anns_field="sparse_embedding",
-            param={"metric_type": "BM25"},
-            limit=candidate_k * 2,
-            expr=child_filter,
-        )
-        child_hits = client.hybrid_search(
-            collection_name=config.MILVUS_COLLECTION,
-            reqs=[dense_req, sparse_req],
-            ranker=RRFRanker(),
-            limit=candidate_k,
-            output_fields=["parent_id"],
-            consistency_level="Strong",
-        )
-        parent_ids = {
-            hit.get("entity", {}).get("parent_id")
-            for hits in child_hits
-            for hit in hits
-            if hit.get("entity", {}).get("parent_id") is not None
-        }
-        if not parent_ids:
-            return []
-        quoted_ids = ", ".join(f'"{pid}"' for pid in parent_ids)
-        parent_filter = (
-            f"parent_id in [{quoted_ids}] and hierarchy == 'parent' and is_search == true"
-        )
-        return client.query(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=parent_filter,
-            output_fields=["parent_id", "contents", "content_hash", "type", "filename"],
-            consistency_level="Strong",
-        )
+    def _search(connection: Any) -> List[Dict[str, Any]]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                _HYBRID_SEARCH_SQL.format(table=config.POSTGRES_TABLE),
+                {
+                    "qvec": str(query_embedding),
+                    "qtext": query_text,
+                    "scope": content_hash,
+                    "wide": candidate_k * 2,
+                    "cand": candidate_k,
+                },
+            )
+            return [
+                {"parent_id": r[0], "contents": r[1], "content_hash": r[2],
+                 "type": r[3], "filename": r[4]}
+                for r in cursor.fetchall()
+            ]
 
-    parents = _milvus_read(_search)
+    parents = _pg_read(_search)
 
     if use_rerank and parents:
         with _rerank_lock:
@@ -406,78 +432,84 @@ def search_vectors(
     return parents
 
 
-def upload_to_milvus(
-    doc: "fitz.Document",
+def _as_params(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt a processing_pipeline row for insertion.
+
+    Only the vector needs adapting: pgvector accepts its text form, "[1.0,2.0]",
+    which is exactly str() of a Python list. Every other key maps to a column
+    of the same name.
+    """
+    params = dict(row)
+    params["dense_embedding"] = str(row["dense_embedding"])
+    return params
+
+
+def upload_to_postgres(
+    doc: "PdfBundle",
     file_uuid: str,
     model: "SentenceTransformer",
     filename: str = "",
     content_hash: str = "",
 ) -> None:
-    """Ingest a document into Milvus and name it with a pointer row.
+    """Ingest a document into Postgres and name it with a pointer row.
 
     1. uuid already known -> nothing to do.
     2. content already ingested -> skip chunking, write the pointer only.
     3. new content -> full ingest, then the pointer.
-
-    The pointer is written LAST on purpose: a crash before it leaves unnamed
-    chunks, which the next ingest of the same content picks up and names. The
-    reverse order would leave a pointer aimed at nothing, permanently.
     """
     if not content_hash:
         raise ValueError("content_hash is required; it is the ownership key")
+
+    table = config.POSTGRES_TABLE
+    insert_sql = _INSERT_SQL.format(table=table)
+
     try:
-        client = get_milvus_client()
+        with get_pool().connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT 1 FROM {table} WHERE file_uuid = %s LIMIT 1",
+                    (file_uuid,),
+                )
+                if cursor.fetchone():
+                    logger.info("File %s already present; skipping upload", file_uuid)
+                    return
 
-        if not client.has_collection(config.MILVUS_COLLECTION):
-            logger.error(
-                "Collection '%s' does not exist; cannot upload file %s",
-                config.MILVUS_COLLECTION, file_uuid,
-            )
-            return
+                cursor.execute(
+                    f"SELECT 1 FROM {table} WHERE content_hash = %s AND is_search LIMIT 1",
+                    (content_hash,),
+                )
+                if cursor.fetchone():
+                    logger.info(
+                        "Content of file %s already ingested (hash match); "
+                        "writing pointer only", file_uuid,
+                    )
+                else:
+                    logger.info("Processing file %s for upload", file_uuid)
+                    rows = processing_pipeline(doc, content_hash, model, filename=filename)
+                    if not rows:
+                        logger.warning(
+                            "Processing produced no rows for file %s; nothing to upload",
+                            file_uuid,
+                        )
+                        return
+                    cursor.executemany(insert_sql, [_as_params(row) for row in rows])
+                    logger.info("Inserted %d record(s) for file %s", len(rows), file_uuid)
 
-        known = client.query(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=f'file_uuid == "{file_uuid}"',
-            output_fields=["file_uuid"],
-            limit=1,
-        )
-        if known:
-            logger.info("File %s already present in collection; skipping upload", file_uuid)
-            return
+                cursor.execute(
+                    insert_sql,
+                    _as_params(_pointer_row(
+                        file_uuid, filename, content_hash,
+                        model.get_sentence_embedding_dimension(),
+                    )),
+                )
+            connection.commit()
 
-        content_present = client.query(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=f'content_hash == "{content_hash}" and is_search == true',
-            output_fields=["content_hash"],
-            limit=1,
-        )
-        if content_present:
-            logger.info(
-                "Content of file %s already ingested (hash match); writing pointer only",
-                file_uuid,
-            )
-        else:
-            logger.info("Processing file %s for upload", file_uuid)
-            rows = processing_pipeline(doc, content_hash, model, filename=filename)
-            if not rows:
-                logger.warning("Processing produced no rows for file %s; nothing to upload", file_uuid)
-                return
-            result = client.insert(collection_name=config.MILVUS_COLLECTION, data=rows)
-            logger.info("Inserted %s record(s) for file %s", result["insert_count"], file_uuid)
-
-        client.insert(
-            collection_name=config.MILVUS_COLLECTION,
-            data=[_pointer_row(file_uuid, filename, content_hash,
-                               model.get_sentence_embedding_dimension())],
-        )
-
-    except Exception:
-        reset_client()
+    except psycopg.OperationalError:
+        reset_pool()
         raise
-    
 
 def delete_document(file_uuid: str) -> Dict[str, Any]:
-    """Remove a uuid from Milvus. Idempotent.
+    """Remove a uuid from Postgres. Idempotent.
 
     Deletes the uuid's pointer row. The chunks go only when no other uuid still
     names that content, so deleting one copy never breaks its duplicates.
@@ -486,51 +518,52 @@ def delete_document(file_uuid: str) -> Dict[str, Any]:
         ``{"deleted": bool, "kind": str}`` where kind is one of
         ``not_found`` | ``pointer_removed`` | ``content_removed``.
     """
+    table = config.POSTGRES_TABLE
     try:
-        client = get_milvus_client()
+        with get_pool().connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT content_hash FROM {table} WHERE file_uuid = %s LIMIT 1",
+                    (file_uuid,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    logger.info(
+                        "Delete requested for unknown document %s; nothing to do",
+                        file_uuid,
+                    )
+                    return {"deleted": False, "kind": "not_found"}
+                content_hash = row[0]
 
-        rows = client.query(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=f'file_uuid == "{file_uuid}"',
-            output_fields=["content_hash"],
-            limit=1,
-        )
-        if not rows:
-            logger.info("Delete requested for unknown document %s; nothing to do", file_uuid)
-            return {"deleted": False, "kind": "not_found"}
+                cursor.execute(f"DELETE FROM {table} WHERE file_uuid = %s", (file_uuid,))
 
-        content_hash = rows[0]["content_hash"]
+                # Other pointers naming this content? Checked AFTER the delete,
+                # which is safe here (unlike in Milvus) because both statements
+                # share one transaction and see each other immediately.
+                cursor.execute(
+                    f"SELECT 1 FROM {table} "
+                    f"WHERE content_hash = %s AND NOT is_search LIMIT 1",
+                    (content_hash,),
+                )
+                if cursor.fetchone():
+                    connection.commit()
+                    logger.info(
+                        "Deleted pointer %s; content still named by other uuid(s)",
+                        file_uuid,
+                    )
+                    return {"deleted": True, "kind": "pointer_removed"}
 
-        # Look for other names BEFORE deleting, so this does not depend on the
-        # delete being visible to the following query.
-        others = client.query(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=(f'content_hash == "{content_hash}" and is_search == false '
-                    f'and file_uuid != "{file_uuid}"'),
-            output_fields=["file_uuid"],
-            limit=1,
-        )
+                cursor.execute(
+                    f"DELETE FROM {table} WHERE content_hash = %s AND is_search",
+                    (content_hash,),
+                )
+            connection.commit()
 
-        client.delete(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=f'file_uuid == "{file_uuid}"',
-        )
-
-        if others:
-            logger.info(
-                "Deleted pointer %s; content still named by other uuid(s)", file_uuid
-            )
-            return {"deleted": True, "kind": "pointer_removed"}
-
-        client.delete(
-            collection_name=config.MILVUS_COLLECTION,
-            filter=f'content_hash == "{content_hash}" and is_search == true',
-        )
         logger.info("Deleted %s and its content (last reference)", file_uuid)
         return {"deleted": True, "kind": "content_removed"}
 
-    except Exception:
-        reset_client()
+    except psycopg.OperationalError:
+        reset_pool()
         raise
 
 
@@ -554,10 +587,11 @@ def _pointer_row(file_uuid: str, filename: str, content_hash: str, embedding_dim
 
 
 # --------------------------------------------------------------------------- #
-# Document -> PDF conversion (Gotenberg sidecar)
+# Document -> PDF conversion (unoserver sidecar)
 # --------------------------------------------------------------------------- #
-# Map of accepted content types to the file extension LibreOffice needs to pick
-# the right import filter. PDF is handled by passthrough, not conversion.
+# Accepted content types for conversion. LibreOffice sniffs the format from
+# file content, so the extension is not used to select an import filter; this
+# map is the supported-types gate. PDF is passthrough, not conversion.
 _CONTENT_TYPE_EXTENSION: Dict[str, str] = {
     "application/doc": ".doc",
     "application/msword": ".doc",
@@ -571,11 +605,14 @@ _CONTENT_TYPE_EXTENSION: Dict[str, str] = {
 
 
 def convert_to_pdf(file_path: str, content_type: str) -> bytes:
-    """Convert a document to PDF, returning the PDF bytes.
+    """Convert a document to PDF via the unoserver sidecar, returning PDF bytes.
 
-    PDFs are returned unchanged. Office and text formats are converted by the
-    Gotenberg LibreOffice route, which preserves layout and tables and paginates
-    correctly (unlike manual text-to-PDF rendering).
+    PDFs are returned unchanged. Office and text formats go to a LibreOffice
+    sidecar container in the same pod, which preserves layout and tables and
+    paginates correctly (unlike manual text-to-PDF rendering).
+
+    LibreOffice cannot live in this image: the base image is RHEL 10, which no
+    longer ships LibreOffice packages. The sidecar runs Ubuntu, which does.
 
     Args:
         file_path: Path to the input file.
@@ -586,37 +623,50 @@ def convert_to_pdf(file_path: str, content_type: str) -> bytes:
 
     Raises:
         ValueError: If the content type is not supported.
-        RuntimeError: If the Gotenberg conversion fails.
+        RuntimeError: If the conversion fails, times out, or the sidecar is
+            unreachable.
     """
     if content_type == "application/pdf":
         with open(file_path, "rb") as handle:
             return handle.read()
 
-    extension = _CONTENT_TYPE_EXTENSION.get(content_type)
-    if extension is None:
+    if content_type not in _CONTENT_TYPE_EXTENSION:
         raise ValueError(f"Unsupported content type for conversion: {content_type}")
 
-    # Give LibreOffice a filename with a recognizable extension regardless of how
-    # the temp file on disk happens to be named.
-    base = os.path.basename(file_path)
-    upload_name = base if base.lower().endswith(extension) else f"document{extension}"
+    from unoserver.client import UnoClient
 
-    url = f"{config.GOTENBERG_URL}/forms/libreoffice/convert"
-    logger.debug("Converting '%s' (%s) to PDF via Gotenberg", upload_name, content_type)
+    logger.debug("Converting '%s' (%s) to PDF via unoserver", file_path, content_type)
 
+    with open(file_path, "rb") as handle:
+        source_bytes = handle.read()
+
+    # host_location only affects the inpath (file-path) code path, which we do
+    # not use — we always send bytes. Set to 'remote' as documentation: the
+    # sidecar shares our network namespace but NOT our filesystem.
+    client = UnoClient(
+        server=config.UNOSERVER_HOST,
+        port=str(config.UNOSERVER_PORT),
+        host_location="remote",
+    )
+
+    # UnoClient has no timeout of its own. Without one, a sidecar that accepts
+    # the connection and then hangs blocks the single ingestion worker forever.
+    # setdefaulttimeout is process-global, but conversion only ever runs on that
+    # one worker thread, and the previous value is restored in finally.
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(config.UNOSERVER_TIMEOUT)
     try:
-        with open(file_path, "rb") as handle:
-            response = requests.post(
-                url,
-                files={"files": (upload_name, handle, content_type)},
-                timeout=config.GOTENBERG_TIMEOUT,
-            )
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Gotenberg conversion failed for {upload_name}: {exc}") from exc
+        pdf_bytes = client.convert(indata=source_bytes, convert_to="pdf")
+    except Exception as exc:
+        raise RuntimeError(f"unoserver conversion failed for {file_path}: {exc}") from exc
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
 
-    logger.debug("Gotenberg returned %d bytes of PDF", len(response.content))
-    return response.content
+    if not pdf_bytes:
+        raise RuntimeError(f"unoserver returned no PDF for {file_path}")
+
+    logger.debug("unoserver returned %d bytes of PDF", len(pdf_bytes))
+    return pdf_bytes
 
 # --------------------------------------------------------------------------- #
 # CSX storage retrieval

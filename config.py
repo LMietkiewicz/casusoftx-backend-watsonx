@@ -6,11 +6,12 @@ configuration at import time so that misconfiguration fails fast at startup
 rather than surfacing as an obscure runtime error deep in a request handler.
 
 All values are exposed as module-level constants and may be imported directly,
-e.g. ``import config; config.MILVUS_HOST``.
+e.g. ``import config; config.POSTGRES_HOST``.
 """
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -182,7 +183,9 @@ MODEL: str = _resolve_model()
 # The embedding dimension is NOT configured — it is read from this encoder at
 # runtime so schema and model can never drift. Changing the encoder changes the
 # embedding dimension and invalidates ALL stored vectors (requires a full
-# reset_collection + re-ingest), hence the gate + warning.
+# `python pgstore.py --reset` + re-ingest), hence the gate + warning.
+# ensure_schema() now enforces this at startup: it compares the encoder's
+# dimension against the live column and refuses to start if they disagree.
 DEFAULT_ENCODER_MODEL: str = "sdadas/mmlw-retrieval-roberta-large-v2"
 
 
@@ -205,7 +208,8 @@ def _resolve_encoder() -> str:
 
 ENCODER_MODEL: str = _resolve_encoder()
 
-# Dense-query prefix for mmlw-retrieval (queries only; never BM25/passages).
+# Dense-query prefix for mmlw-retrieval. Applied to the DENSE query only —
+# never to the full-text leg of hybrid search, and never to passages.
 QUERY_PREFIX: str = _get_str("QUERY_PREFIX", "zapytanie: ")
 
 # Base URL of the inference backend (Ollama host or watsonx endpoint).
@@ -224,11 +228,16 @@ COERCION_THRESHOLD: float = _get_float("COERCION_THRESHOLD", 0.80)
 COERCION_TIE_EPSILON: float = _get_float("COERCION_TIE_EPSILON", 0.02)
 
 # --------------------------------------------------------------------------- #
-# Milvus configuration
+# Pgvector configuration
 # --------------------------------------------------------------------------- #
-MILVUS_HOST: str = _get_str("MILVUS_HOST", "localhost")
-MILVUS_PORT: int = _get_int("MILVUS_PORT", 19530)
-MILVUS_COLLECTION: str = _get_str("MILVUS_COLLECTION", "file_embeddings")
+POSTGRES_HOST: str = _get_str("POSTGRES_HOST", "localhost")
+POSTGRES_PORT: int = _get_int("POSTGRES_PORT", 5432)
+POSTGRES_DB: str = _get_str("POSTGRES_DB", "casusoftx")
+POSTGRES_USER: str = _get_str("POSTGRES_USER", "casusoftx")
+POSTGRES_PASSWORD: str = _get_secret("POSTGRES_PASSWORD", "")
+POSTGRES_TABLE: str = _get_str("POSTGRES_TABLE", "chunks")
+POSTGRES_POOL_MAX: int = _get_int("POSTGRES_POOL_MAX", 8)
+POSTGRES_POOL_TIMEOUT: int = _get_int("POSTGRES_POOL_TIMEOUT", 30)
 
 # --------------------------------------------------------------------------- #
 # CasuSoft X storage (s3-gateway)
@@ -244,13 +253,17 @@ CSX_TIMEOUT = float(os.getenv("CSX_TIMEOUT", "30"))
 MAX_DOCUMENT_BYTES = int(os.getenv("MAX_DOCUMENT_BYTES", str(200 * 1024 * 1024)))
 
 # --------------------------------------------------------------------------- #
-# Document conversion (Gotenberg sidecar)
+# Document conversion (unoserver sidecar)
 # --------------------------------------------------------------------------- #
-# Base URL of the Gotenberg service used to convert office formats to PDF.
-# In a docker-compose setup this is typically the service name, e.g.
-# "http://gotenberg:3000".
-GOTENBERG_URL: str = _get_str("GOTENBERG_URL", "http://gotenberg:3000")
-GOTENBERG_TIMEOUT: int = _get_int("GOTENBERG_TIMEOUT", 60)
+# LibreOffice runs in a sidecar container in the same pod, so the default host
+# is localhost. The app's own base image (RHEL 10) cannot host LibreOffice.
+UNOSERVER_HOST: str = _get_str("UNOSERVER_HOST", "127.0.0.1")
+UNOSERVER_PORT: int = _get_int("UNOSERVER_PORT", 2003)
+
+# Socket timeout (seconds) for a conversion. Measured conversions run 0.1-2.5s;
+# this is not a slow-document guard but a bound on a HUNG sidecar. The ingestion
+# executor is single-worker, so a hang stalls every queued document this long.
+UNOSERVER_TIMEOUT: int = _get_int("UNOSERVER_TIMEOUT", 120) 
 
 # --------------------------------------------------------------------------- #
 # Summarization budgets
@@ -370,6 +383,25 @@ def validate() -> None:
     
     if not ENCODER_MODEL:
         raise ConfigError("No encoder configured; set DEFAULT_ENCODER_MODEL in config.py.")
+
+    for name, value in (("POSTGRES_HOST", POSTGRES_HOST),
+                        ("POSTGRES_DB", POSTGRES_DB),
+                        ("POSTGRES_USER", POSTGRES_USER)):
+        if not value:
+            raise ConfigError(f"{name} is required")
+
+    # POSTGRES_TABLE is interpolated directly into SQL — an identifier cannot be
+    # passed as a bound parameter — so it is the one config value that could
+    # carry an injection. Restrict it to a plain unquoted identifier.
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", POSTGRES_TABLE or ""):
+        raise ConfigError(
+            f"POSTGRES_TABLE must be a plain identifier "
+            f"(letters, digits, underscore; not starting with a digit), "
+            f"got {POSTGRES_TABLE!r}"
+        )
+
+    if POSTGRES_POOL_MAX < 1:
+        raise ConfigError(f"POSTGRES_POOL_MAX must be >= 1, got {POSTGRES_POOL_MAX}")
 
     if PROVIDER == "watsonx":
         if not API_KEY:

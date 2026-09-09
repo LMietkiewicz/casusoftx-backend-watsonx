@@ -7,10 +7,10 @@ Exposes:
   storage and processes it in the background, delivering each task result via
   the success/error callback URLs.
 * ``POST   /api/query``                 - synchronous RAG query over ingested documents.
-* ``DELETE /ai/document/<document_id>`` - removes a document's data from Milvus.
+* ``DELETE /ai/document/<document_id>`` - removes a document's data from Postgres.
 * ``GET    /health``                    - liveness probe.
 
-Retrieval from CSX storage (``fetch_document``), ingestion (``upload_to_milvus``),
+Retrieval from CSX storage (``fetch_document``), ingestion (``upload_to_postgres``),
 search (``search_vectors``), conversion (``convert_to_pdf``) and the per-task LLM
 operations live in their own modules; this file is the HTTP layer, task routing,
 and background orchestration.
@@ -27,8 +27,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List
 
-import io
-import pdfplumber
 import hashlib
 import requests
 from flask import Flask, jsonify, request
@@ -37,7 +35,8 @@ from waitress import serve
 
 import config
 from logging_utils import preview, setup_logging
-from milvus import ensure_collection
+from pdf_io import PdfBundle
+from pgstore import ensure_schema
 from tasks import (
     base_extraction,
     category_subcategory,
@@ -55,7 +54,7 @@ from utils import (
     fetch_document,
     fetch_document_text,
     search_vectors,
-    upload_to_milvus,
+    upload_to_postgres,
 )
 
 # Configure logging before anything else so module-level events are formatted.
@@ -97,8 +96,8 @@ app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
 
 # Single-worker ingestion: documents are processed strictly one after another
 # (ingest + summary + tasks all run inline on this one worker). This serializes
-# the encoder-heavy work, keeps Milvus inserts ordered, and makes the
-# existence-check/insert in upload_to_milvus race-free (no concurrent ingest).
+# the encoder-heavy work, keeps inserts ordered, and makes the
+# existence-check/insert in upload_to_postgres race-free (no concurrent ingest).
 ingest_executor = ThreadPoolExecutor(max_workers=1)
 
 # Admission control: bound the number of documents queued/in-flight so a burst
@@ -152,7 +151,7 @@ def run_rag_with_context(
 
     Args:
         query: The user's query.
-        context_fragments: Parent chunks retrieved from Milvus.
+        context_fragments: Parent chunks retrieved from Postgres.
         is_global_search: True if the search spanned all documents.
 
     Returns:
@@ -317,7 +316,10 @@ def create_task() -> Any:
             return json.loads(value) if isinstance(value, str) else value
 
         # Round-tripping through uuid.UUID validates the format and normalises
-        # case; it is what makes interpolating this into a Milvus filter safe.
+        # case. Values now reach Postgres as bound parameters rather than being
+        # interpolated into a filter string, so this is input validation and
+        # case normalisation — no longer the thing standing between us and
+        # injection.
         file_uuid = str(uuid.UUID(str(data["fileUuid"])))
         tasks = _maybe_json(data["tasks"], [])
         params = _maybe_json(data.get("params"), {})
@@ -352,7 +354,8 @@ def create_task() -> Any:
 
         try:
             # Extension is irrelevant: routing is by Content-Type, and
-            # convert_to_pdf substitutes a correct name for the converter.
+            # convert_to_pdf sends raw bytes to the sidecar — no filename is
+            # transmitted at all, and LibreOffice sniffs the format from content.
             temp_file_path = os.path.join(tempfile.gettempdir(), f"{file_uuid}.{uuid.uuid4().hex[:8]}.bin")
 
             # Generate task ids up front and return them immediately.
@@ -369,10 +372,10 @@ def create_task() -> Any:
                     )
 
             def _ingest_and_run(open_doc: Callable[[], Any], content_hash: str, filename: str) -> None:
-                # Open once to ingest into Milvus, once more to summarize (the
-                # first context manager closes the document), then run the tasks.
+                # Open once to ingest into Postgres, once more to summarize (the
+                # first context manager closes both handles), then run the tasks.
                 with open_doc() as doc:
-                    upload_to_milvus(doc, file_uuid, encoder_ingest, filename, content_hash)
+                    upload_to_postgres(doc, file_uuid, encoder_ingest, filename, content_hash)
                 with open_doc() as doc:
                     precomputed_summary = summary(doc)
                 _run_tasks_inline(precomputed_summary)
@@ -393,13 +396,14 @@ def create_task() -> Any:
                     content_hash = digest.hexdigest()
 
                     if content_type == "application/pdf":
-                        _ingest_and_run(lambda: pdfplumber.open(temp_file_path), content_hash, filename)
+                        _ingest_and_run(lambda: PdfBundle(temp_file_path), content_hash, filename)
                     else:
                         pdf_bytes = convert_to_pdf(temp_file_path, content_type)
                         _ingest_and_run(
-                            lambda: pdfplumber.open(io.BytesIO(pdf_bytes)),
-                            content_hash, filename
+                            lambda: PdfBundle(pdf_bytes),
+                            content_hash, filename,
                         )
+
                 except Exception as exc:
                     logger.error("Background processing failed for document %s: %s", file_uuid, exc)
                     send_callback(error_cb, {"documentId": file_uuid, "taskType": "error", "error": str(exc)})
@@ -487,7 +491,7 @@ def sync_query() -> Any:
 
 @app.route("/ai/document/<document_id>", methods=["DELETE"])
 def delete_document_route(document_id: str) -> Any:
-    """Remove a document's data from Milvus.
+    """Remove a document's data from Postgres.
 
     Idempotent: deleting a uuid that was never ingested is a success, not an
     error. Chunks are removed only when no other uuid still names that content.
@@ -520,8 +524,8 @@ def delete_document_route(document_id: str) -> Any:
 if __name__ == "__main__":
     port = config.APP_PORT
     try:
-        # Ensure the Milvus collection exists, sized to the live encoder.
-        ensure_collection(encoder_ingest.get_sentence_embedding_dimension())
+        # Ensure the Postgres schema exists, sized to the live encoder.
+        ensure_schema(encoder_ingest.get_sentence_embedding_dimension())
         logger.info("Starting backend server on host 0.0.0.0, port %s", port)
         serve(app, host="0.0.0.0", port=port)
     except Exception as exc:

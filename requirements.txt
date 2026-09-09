@@ -1,6 +1,6 @@
-# Pinned direct dependencies. Versions current as of 2026-06-13.
+# Pinned direct dependencies. Versions current as of 2026-09-03.
 # These pin only DIRECT deps — see the note at the bottom about locking the full
-# transitive tree (torch in particular) for true reproducibility.
+# transitive tree for true reproducibility.
 
 # --- Web layer ---
 flask==3.1.3
@@ -10,13 +10,29 @@ waitress==3.0.2
 requests==2.34.2
 
 # --- Documents ---
-PyMuPDF==1.27.2.3              # provides the `fitz` module
+# Text extraction. PDFium keeps multi-column reading order (pdfminer does not)
+# and is ~75x faster on text-only pages. Native s390x wheels since 5.11.0.
+pypdfium2==5.13.0
+# Table extraction only — PDFium exposes no table API. Pure Python.
+# NOTE: declares Pillow>=12.2.0, which has NO s390x wheel (sdist only).
+# Pillow is imported lazily by pdfplumber and only inside to_image(), which we
+# never call, so it is installed with --no-deps in the Dockerfile to avoid a
+# source build. Its other deps are pinned explicitly below.
+pdfplumber==0.11.10
+pdfminer.six==20260107        # pdfplumber's exact pin; pure Python
+
+# --- Document conversion ---
+# XML-RPC client for the LibreOffice sidecar. Zero dependencies (stdlib only);
+# needs no LibreOffice or pyuno in this container.
+unoserver==3.7
 
 # --- Embeddings / vector database ---
+# torch is NOT listed: it is supplied by the IBM Z base image (2.11.0+cpu) and
+# must never be replaced by a PyPI build, which has no s390x wheel. This pin
+# requires torch>=1.11.0, which the base image satisfies, so pip leaves it be.
 sentence-transformers==5.5.1
-pymilvus==2.6.15              # MUST match your Milvus SERVER major version.
-                              # Code targets the 2.x API; do NOT use 3.0.0
-                              # unless you have moved to a Milvus 3.x server.
+psycopg==3.3.4
+psycopg-pool==3.3.1
 
 # --- Watsonx provider (pin matters: the structured-output / response_format API) ---
 ibm-watsonx-ai==1.5.13
@@ -30,7 +46,5 @@ cryptography==49.0.0
 # --- Configuration ---
 python-dotenv==1.2.2
 
-# Removed: python-docx — not imported anywhere (Gotenberg handles conversion).
-
-# Run the following to uninstall the hf_xet package - recommended.
-# pip uninstall hf_xet -y
+# Removed: PyMuPDF — replaced by pypdfium2 + pdfplumber (no s390x distribution).
+# Removed: python-docx — still not imported anywhere.

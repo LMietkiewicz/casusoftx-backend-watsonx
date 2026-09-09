@@ -1,7 +1,7 @@
-# =============================================================================
+# ===========================================================================================
 # OpenShift manifests — casusoftx-backend
 #
-# SECRETS: sensitive values (API_KEY, PROJECT_ID, CSX_PASSWORD) are stored
+# SECRETS: sensitive values (API_KEY, PROJECT_ID, CSX_PASSWORD, POSTGRES_PASSWORD) are stored
 # ENCRYPTED as ENC(...) tokens, produced with `python cipher.py encrypt`.
 # Because they are ciphertext they live in the ConfigMap, not the Secret.
 # The ONLY real secret is CONFIG_PASSPHRASE, which decrypts them at startup.
@@ -9,7 +9,7 @@
 # Apply order: ConfigMap -> Secret -> Deployment -> Service -> Route
 # Console: use the "+" icon (top right) -> Import YAML -> paste this whole file
 # CLI:     oc apply -f openshift-manifests.yaml
-# =============================================================================
+# ===========================================================================================
 
 apiVersion: v1
 kind: ConfigMap
@@ -35,14 +35,18 @@ data:
   CSX_PASSWORD: "ENC(CHANGE_ME)"                   
 
   # --- infrastructure ---
-  # Gotenberg is a sidecar: same pod, same network namespace.
-  # http://gotenberg:3000.
-  GOTENBERG_URL: "http://localhost:3000"
+  # unoserver sidecar: same pod, same network namespace.
+  UNOSERVER_HOST: "127.0.0.1"
+  UNOSERVER_PORT: "2003"
+  UNOSERVER_TIMEOUT: "120"
 
-  # Milvus is external. 
-  MILVUS_HOST: "CHANGE_ME"
-  MILVUS_PORT: "19530"
-  MILVUS_COLLECTION: "file_embeddings"
+  # Postgres/pgvector is external. 
+  POSTGRES_HOST: "CHANGE_ME"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "casusoftx"
+  POSTGRES_USER: "casusoftx"
+  POSTGRES_PASSWORD: "ENC(CHANGE_ME)"
+  POSTGRES_TABLE: "chunks"
 
   PORT: "5000"
 
@@ -79,7 +83,7 @@ spec:
     spec:
       containers:
         - name: casusoftx-backend
-          image: quay.io/lukasz_mietkiewicz/csx-backend-tests:main
+          image: quay.io/lukasz_mietkiewicz/csx-backend-s390x:main
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
@@ -129,34 +133,31 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
 
-        # --- Gotenberg sidecar ------------------------------------------
-        # Stateless, 1:1 with the app, no persistence — a legitimate sidecar.
-        # Shares the pod's network namespace, so the app reaches it at
-        # localhost:3000.
+        # --- LibreOffice converter sidecar --------------------------------
+        # Replaces Gotenberg. Exists as a separate container because the app's
+        # base image is RHEL 10, which no longer packages LibreOffice, and
+        # Gotenberg publishes no s390x image.
         #
-        # Pinned by digest to prevent drift: the :8 tag floats to the latest
-        # 8.x.y at pull time, so two nodes could run different builds. Get the
-        # digest with:
-        #   docker pull gotenberg/gotenberg:8
-        #   docker inspect --format='{{index .RepoDigests 0}}' gotenberg/gotenberg:8
-        # Keep the :8 in front — it documents the version the digest is.
-        - name: gotenberg
-          image: gotenberg/gotenberg:8@sha256:CHANGE_ME
-          imagePullPolicy: IfNotPresent
+        # unoserver keeps ONE LibreOffice process resident and exposes it over
+        # XML-RPC. That avoids both the ~1.2s per-conversion startup and the
+        # profile-lock contention that makes concurrent 'soffice' invocations
+        # fail silently (measured: 2 of 4 parallel jobs failed, no useful error).
+        #
+        # Built from converter.Dockerfile — there is no upstream image for this.
+        - name: converter
+          image: quay.io/lukasz_mietkiewicz/csx-converter:main
+          imagePullPolicy: Always
 
+          # LibreOffice writes its user profile under HOME. The arbitrary
+          # OpenShift UID has no /etc/passwd entry, so HOME must be set to
+          # something writable or the profile creation fails.
           env:
-            - name: XDG_CONFIG_HOME
-              value: /tmp/xdg-config
-            - name: XDG_CACHE_HOME
-              value: /tmp/xdg-cache
-            - name: XDG_DATA_HOME
-              value: /tmp/xdg-data
             - name: HOME
               value: /tmp
 
           ports:
-            - name: gotenberg
-              containerPort: 3000
+            - name: unoserver
+              containerPort: 2003
               protocol: TCP
 
           resources:
@@ -171,14 +172,26 @@ spec:
             - name: tmp
               mountPath: /tmp
 
+          # tcpSocket, NOT httpGet: unoserver speaks XML-RPC and returns
+          # HTTP 501 to any GET, which Kubernetes counts as a failure. An
+          # httpGet probe here would restart-loop the container forever.
+          startupProbe:
+            tcpSocket:
+              port: 2003
+            periodSeconds: 5
+            failureThreshold: 12   # ~60s; measured cold start is 8-12s
+
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 3000
-            initialDelaySeconds: 10
+            tcpSocket:
+              port: 2003
             periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
 
       volumes:
+        # LibreOffice writes its user profile under HOME (=/tmp). The container
+        # filesystem is read-only to the arbitrary UID, so this must be a real
+        # writable volume, not just an env var.
         - name: tmp
           emptyDir: {}
 

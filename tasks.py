@@ -39,7 +39,7 @@ from processing import TEXT_SEPARATORS, create_text_parent_chunks
 from utils import call_llm, strip_markdown
 
 if TYPE_CHECKING:  # type-only; the doc is passed in, never imported at runtime
-    import fitz
+    from pdf_io import PdfBundle
 
 logger = logging.getLogger(__name__)
 
@@ -192,17 +192,17 @@ def _summarize_text(text: str, *, final: bool) -> str:
     )
 
 
-def summary(doc: "fitz.Document") -> str:
+def summary(doc: "PdfBundle") -> str:
     """Summarize a document (single-pass or map-reduce by token budget).
 
     Args:
-        doc: An open PyMuPDF document.
+        doc: An open PdfBundle object.
 
     Returns:
         A single-paragraph Polish summary with Markdown stripped, or "" if the
         document has no extractable text.
     """
-    full_text = "\n\n".join(page.get_text("text").strip() for page in doc).strip()
+    full_text = "\n\n".join(doc.page_text(i).strip() for i in range(len(doc))).strip()
     if not full_text:
         logger.warning("Document has no extractable text; returning empty summary")
         return ""

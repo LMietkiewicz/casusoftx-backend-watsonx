@@ -1,5 +1,5 @@
 """processing.py - PDF text/table extraction, parent-child chunking, and the
-ingest pipeline that turns a document into Milvus-ready rows.
+ingest pipeline that turns a document into Pgvector-ready rows.
 
 Chunking strategy (parent-child / small-to-big retrieval):
 
@@ -14,8 +14,8 @@ Sizing lives in two independent regimes (see also config.py): the LLM
 summarization budget is unrelated to the *encoder* sequence limit that bounds
 child-chunk size here.
 
-This module imports neither pdfplumber nor sentence-transformers at runtime — the
-``pdfplumber.PDF`` and ``SentenceTransformer`` objects are passed in and used via
+This module imports no PDF library nor sentence-transformers at runtime — the
+``PdfBundle`` and ``SentenceTransformer`` objects are passed in and used via
 duck typing; they appear only as type-checking-time annotations.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ import config
 from logging_utils import preview
 
 if TYPE_CHECKING:  # imported only for type hints; never required at runtime
-    import pdfplumber
+    from pdf_io import PdfBundle
     from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -64,15 +64,15 @@ _ABBREVIATIONS = {
 # --------------------------------------------------------------------------- #
 # Part 1: Extraction
 # --------------------------------------------------------------------------- #
-def extract_text_and_tables(doc: "pdfplumber.PDF") -> Tuple[str, List[Dict[str, Any]]]:
+def extract_text_and_tables(doc: "PdfBundle") -> Tuple[str, List[Dict[str, Any]]]:
     """Extract concatenated text and structured tables from a PDF.
 
-    Note: ``get_text`` already includes table cell text, so table content also
+    Note: ``extract_text`` already includes table cell text, so table content also
     appears in the text stream; tables are additionally captured structurally
     for dedicated row-level chunking.
 
     Args:
-        doc: An open pdfplumber document.
+        doc: An open PdfBundle object.
 
     Returns:
         A tuple of (all page text joined by blank lines, list of table dicts
@@ -81,12 +81,10 @@ def extract_text_and_tables(doc: "pdfplumber.PDF") -> Tuple[str, List[Dict[str, 
     text_parts: List[str] = []
     tables: List[Dict[str, Any]] = []
 
-    for page_num, page in enumerate(doc):
-        text_parts.append(page.get_text("text"))
-        for table in page.find_tables():
-            data = table.extract()
-            if data:
-                tables.append({"page_number": page_num + 1, "data": data})
+    for page_num in range(len(doc)):
+        text_parts.append(doc.page_text(page_num))
+        for data in doc.page_tables(page_num):
+            tables.append({"page_number": page_num + 1, "data": data})
 
     return "\n\n".join(text_parts).strip(), tables
 
@@ -424,16 +422,16 @@ def _compose_parent_id(content_hash: str, local_index: int) -> str:
 # Part 6: Full ingest pipeline
 # --------------------------------------------------------------------------- #
 def processing_pipeline(
-    doc: "pdfplumber.PDF",
+    doc: "PdfBundle",
     content_hash: str,
     model: "SentenceTransformer",
     filename: str = "",
     show_progress: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Process a PDF into Milvus-ready parent and child rows.
+    """Process a PDF into Pgvector-ready parent and child rows.
 
     Args:
-        doc: An open pdfplumber document.
+        doc: An open PdfBundle object.
         content_hash: SHA-256 of the source bytes; owns these rows and seeds
             parent-id composition.
         model: Sentence-transformer encoder for dense child embeddings.
@@ -441,7 +439,7 @@ def processing_pipeline(
         show_progress: Whether the encoder shows a progress bar (off in prod).
 
     Returns:
-        Rows ready for ``MilvusClient.insert`` — parent rows (placeholder dense
+        Rows ready for Pgvector — parent rows (placeholder dense
         vector) and child rows (real dense embedding).
     """
     full_text, tables = extract_text_and_tables(doc)
