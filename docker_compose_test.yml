@@ -1,0 +1,129 @@
+# docker-compose.test.yml — backend integration test, s390x images under QEMU.
+#
+# Lives at the root of the CSX install package (csx-insall-new-072026/) so the
+# `build:` paths for their postgres/storage resolve.
+#
+# Mixed-architecture stack: the two s390x images (backend, converter) run under
+# QEMU via `platform:`; everything else is native amd64. Docker Desktop needs
+# binfmt registered first:  docker run --privileged --rm tonistiigi/binfmt --install s390x
+#
+# Order:
+#   docker compose -f docker-compose.test.yml build
+#   docker compose -f docker-compose.test.yml up -d postgres minio casusoftxstorage pgvector converter
+#   docker compose -f docker-compose.test.yml logs -f casusoftxstorage     # wait for 8989
+#   docker compose -f docker-compose.test.yml up -d casusoftx-backend
+#   docker compose -f docker-compose.test.yml logs -f casusoftx-backend    # model load is SLOW under QEMU
+#
+# Change the backend env -> `up -d --force-recreate casusoftx-backend`, or the
+# old container keeps the old env.
+
+services:
+  # --- CSX's stack: unchanged from the August compose --------------------------
+  postgres:
+    image: csx-db:latest
+    build: ./postgresql
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports: ["5432:5432"]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+
+  casusoftxstorage:
+    image: csx-storage:latest
+    build: ./casusoftxstorage
+    ports: ["8989:8989"]
+    depends_on: [postgres, minio]
+
+  # --- Replaces Milvus. Native amd64; the backend only talks libpq to it. --------
+  # Separate from CSX's `postgres` on purpose: different database, different
+  # role, and it's the one that goes away when the client provides their own.
+  # Host port 5433 because CSX's postgres already owns 5432.
+  pgvector:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: casusoftx
+      POSTGRES_USER: casusoftx
+      POSTGRES_PASSWORD: casusoftx
+    ports: ["5433:5432"]
+    volumes:
+      - pgvectordata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U casusoftx -d casusoftx"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # --- Replaces Gotenberg. The LibreOffice/unoserver sidecar, s390x. -----------
+  # In the pod it shares the backend's network namespace (UNOSERVER_HOST=127.0.0.1
+  # in the manifest); here it's a separate service, reached by name.
+  converter:
+    image: quay.io/lukasz_mietkiewicz/csx-converter:main
+    platform: linux/s390x
+    environment:
+      HOME: /tmp
+    # Not published: only the backend talks to it, and it answers HTTP 501 to
+    # anything that isn't XML-RPC anyway.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/2003'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30      # cold start is ~10s natively; allow a lot more under QEMU
+
+  # --- Your backend, s390x. -----------------------------------------------------
+  casusoftx-backend:
+    image: quay.io/lukasz_mietkiewicz/csx-backend-s390x:main
+    platform: linux/s390x
+    ports: ["5000:5000"]
+    environment:
+      # inference
+      PROVIDER: watsonx
+      INFERENCE_PROVIDER_BASE_URL: https://eu-de.ml.cloud.ibm.com
+      CONFIG_PASSPHRASE: "CHANGE_ME"
+      API_KEY: "ENC(CHANGE_ME)"          # or plaintext for the test; then no CONFIG_PASSPHRASE needed
+      PROJECT_ID: "ENC(CHANGE_ME)"
+
+      # CSX storage
+      CSX_BASE_URL: http://casusoftxstorage:8989
+      CSX_USERNAME: casusoftxproxy
+      CSX_PASSWORD: casusoftxproxy
+
+      # pgvector (service name, container-side port)
+      POSTGRES_HOST: pgvector
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: casusoftx
+      POSTGRES_USER: casusoftx
+      POSTGRES_PASSWORD: casusoftx
+      POSTGRES_TABLE: chunks
+
+      # converter (service name, NOT 127.0.0.1 — separate network namespace here)
+      UNOSERVER_HOST: converter
+      UNOSERVER_PORT: "2003"
+      UNOSERVER_TIMEOUT: "600"          # QEMU: LibreOffice is slow; don't let the 120s guard fire
+
+      # keep the reranker on for the first run to see it work; flip to "false"
+      # if query latency under QEMU makes testing painful
+      RERANK_ENABLED: "true"
+      RERANK_CANDIDATES: "16"
+
+      # local only — writes document content and LLM I/O to logs. Never in the manifest.
+      DEBUG: "true"
+      ACKNOWLEDGE_SENSITIVE_LOGGING: "true"
+    depends_on:
+      casusoftxstorage:
+        condition: service_started
+      pgvector:
+        condition: service_healthy
+      converter:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  miniodata:
+  pgvectordata:

@@ -18,7 +18,6 @@ pypdfium2==5.13.0
 # Pillow is imported lazily by pdfplumber and only inside to_image(), which we
 # never call, so it is installed with --no-deps in the Dockerfile to avoid a
 # source build. Its other deps are pinned explicitly below.
-pdfplumber==0.11.10
 pdfminer.six==20260107        # pdfplumber's exact pin; pure Python
 
 # --- Document conversion ---
