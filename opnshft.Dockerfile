@@ -10,6 +10,15 @@
 # GID 0 — NOT root, and NOT the UID in the USER directive. Hence the group
 # ownership fixup and the writable HOME.
 #
+# Verified against the image (2026-09), emulated s390x:
+#   OS                RHEL 10.2 (Coughlan)
+#   Python            3.12.13 (system python; torch in /usr/local/lib64)
+#   torch             2.11.0+cpu
+#   preinstalled      numpy 2.5.1, transformers 5.14.1
+#   repos enabled     ubi-10 BaseOS + AppStream, CodeReady Builder, EPEL
+#   missing           libpq (hence postgresql-libs below)
+#   default user      NON-ROOT (hence USER root before dnf)
+#
 # Build:  docker build -f opnshft.Dockerfile -t casusoftx-backend:ocp .
 # =============================================================================
 
@@ -30,21 +39,34 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# Several transitive dependencies have NO s390x wheel on PyPI and must compile
-# from source: numpy, scipy, scikit-learn, pandas, cryptography, grpcio,
-# markupsafe (cryptography and orjson also need Rust). The toolchain is
-# installed, used, and removed in ONE layer so it does not ship in the image.
+# The base image runs as a NON-ROOT user, so dnf refuses with "This command has
+# to be run with superuser privileges". USER 1001 at the bottom switches back.
+USER root
+
+# Package names verified against this image with `dnf --downloadonly`: all
+# resolve (32 packages, 206 MB) from the enabled repos, which include
+# CodeReady Builder — where the -devel packages live.
+#
+# Still compiled from source (no s390x wheel on PyPI, ever): scipy,
+# scikit-learn, pandas, cryptography (needs Rust — its sdist declares maturin),
+# grpcio, markupsafe. numpy and transformers are ALREADY in the base image and
+# are left alone.
+#
+# The toolchain is installed, used, and removed in ONE layer so its 206 MB does
+# not ship. postgresql-libs and curl are installed AFTER the removal, so dnf
+# cannot take them out as dependencies of something being removed.
 #
 # pdfplumber is installed --no-deps first: it declares Pillow>=12.2.0, which has
 # no s390x wheel either, but Pillow is imported lazily and only inside
-# to_image(), which this codebase never calls. pdfminer.six and pypdfium2 (its
-# real dependencies) are pinned explicitly in requirements.txt.
+# to_image(), which this codebase never calls (verified with an import blocker:
+# text and table extraction both run with PIL absent). pdfminer.six and
+# pypdfium2 (its real dependencies) are pinned explicitly in requirements.txt.
 #
 # torch is NOT in requirements.txt: the base image supplies 2.11.0+cpu and pip
-# leaves it alone because it satisfies the sentence-transformers constraint.
+# leaves it alone because it satisfies sentence-transformers' torch>=1.11.0.
 #
-# >>> Run s390x_audit.py INSIDE this image and trim this list. Some of these
-# >>> are likely already satisfied by the base image (numpy in particular).
+# NOTE: python3-devel pulls python3 3.12.14, a patch above the image's 3.12.13.
+# Same minor version, so ABI-compatible for the extensions built here.
 RUN dnf install -y --setopt=install_weak_deps=False \
         gcc gcc-c++ gcc-gfortran make python3-devel \
         openssl-devel openblas-devel rust cargo \
@@ -59,6 +81,21 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 RUN python3 -c "import torch; \
     assert not torch.version.cuda, f'non-IBM torch: {torch.__version__}'; \
     print('torch OK:', torch.__version__, torch.__file__)"
+
+# Fail the build if the BINARY psycopg got installed — psycopg-binary has no
+# s390x wheel, so its presence means psycopg[binary] crept into requirements.
+# The pure-Python implementation loads libpq at import, hence postgresql-libs.
+RUN python3 -c "import psycopg; \
+    assert psycopg.pq.__impl__ == 'python', f'unexpected impl: {psycopg.pq.__impl__}'; \
+    print('psycopg', psycopg.__version__, 'impl', psycopg.pq.__impl__, \
+          'libpq', psycopg.pq.version())"
+
+# Fail the build if any direct dependency is missing or broken. Runs while the
+# toolchain is already gone, so it also proves nothing needed it at runtime.
+RUN python3 -c "import flask, waitress, requests, pypdfium2, pdfplumber, \
+    pdfminer, unoserver.client, sentence_transformers, psycopg, psycopg_pool, \
+    ibm_watsonx_ai, pydantic, cryptography, dotenv; \
+    print('all direct imports OK')"
 
 # Bake the models in so startup needs no network.
 RUN python3 -c "from sentence_transformers import SentenceTransformer, CrossEncoder; \

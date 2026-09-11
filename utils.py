@@ -407,7 +407,7 @@ def search_vectors(
                     "qvec": str(query_embedding),
                     "qtext": query_text,
                     "scope": content_hash,
-                    "wide": candidate_k * 2,
+                    "wide": candidate_k * 5,
                     "cand": candidate_k,
                 },
             )

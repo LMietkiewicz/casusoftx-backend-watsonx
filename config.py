@@ -313,7 +313,7 @@ RAG_CONTEXT_TOKEN_BUDGET: int = _resolve_context_budget(MODEL)
 # --------------------------------------------------------------------------- #
 RERANK_ENABLED: bool = _get_bool("RERANK_ENABLED", True)
 RERANKER_MODEL: str = _get_str("RERANKER_MODEL", "sdadas/polish-reranker-roberta-v3")
-RERANK_CANDIDATES: int = _get_int("RERANK_CANDIDATES", 50)
+RERANK_CANDIDATES: int = _get_int("RERANK_CANDIDATES", 20)
 RERANK_TOP_K: int = _get_int("RERANK_TOP_K", 10)
 
 # --------------------------------------------------------------------------- #
