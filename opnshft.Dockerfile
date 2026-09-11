@@ -72,9 +72,11 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         openssl-devel openblas-devel rust cargo \
  && pip install --no-cache-dir --no-deps pdfplumber==0.11.10 \
  && pip install --no-cache-dir -r requirements.txt \
- && dnf remove -y gcc gcc-c++ gcc-gfortran make python3-devel \
+ && dnf remove -y --setopt=clean_requirements_on_remove=False \
+        gcc gcc-c++ gcc-gfortran make python3-devel \
         openssl-devel openblas-devel rust cargo \
  && dnf install -y --setopt=install_weak_deps=False curl postgresql-libs \
+        libgfortran libgomp openblas openblas-openmp \
  && dnf clean all && rm -rf /var/cache/dnf /root/.cargo
 
 # Fail the build if pip replaced the vendor torch with a PyPI build.
@@ -94,8 +96,7 @@ RUN python3 -c "import psycopg; \
 # toolchain is already gone, so it also proves nothing needed it at runtime.
 RUN python3 -c "import flask, waitress, requests, pypdfium2, pdfplumber, \
     pdfminer, unoserver.client, sentence_transformers, psycopg, psycopg_pool, \
-    ibm_watsonx_ai, pydantic, cryptography, dotenv; \
-    print('all direct imports OK')"
+    ibm_watsonx_ai, pydantic, cryptography, dotenv, scipy, sklearn, pandas; \
 
 # Bake the models in so startup needs no network.
 RUN python3 -c "from sentence_transformers import SentenceTransformer, CrossEncoder; \
