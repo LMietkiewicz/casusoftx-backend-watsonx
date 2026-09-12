@@ -32,7 +32,7 @@ data:
   # --- CasuSoft X storage (s3-gateway) ---
   CSX_BASE_URL: "CHANGE_ME"                        
   CSX_USERNAME: "casusoftxproxy"                  
-  CSX_PASSWORD: "ENC(CHANGE_ME)"                   
+  CSX_PASSWORD: "CHANGE_ME"                   
 
   # --- infrastructure ---
   # unoserver sidecar: same pod, same network namespace.
