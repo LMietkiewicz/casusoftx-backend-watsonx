@@ -97,6 +97,7 @@ RUN python3 -c "import psycopg; \
 RUN python3 -c "import flask, waitress, requests, pypdfium2, pdfplumber, \
     pdfminer, unoserver.client, sentence_transformers, psycopg, psycopg_pool, \
     ibm_watsonx_ai, pydantic, cryptography, dotenv, scipy, sklearn, pandas; \
+    print('all direct imports OK')"
 
 # Bake the models in so startup needs no network.
 RUN python3 -c "from sentence_transformers import SentenceTransformer, CrossEncoder; \
